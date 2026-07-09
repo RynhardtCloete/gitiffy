@@ -1,0 +1,15 @@
+[package]
+name = "gg-askpass"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Tiny helper binary pointed to by GIT_ASKPASS/SSH_ASKPASS."
+
+[[bin]]
+name = "gg-askpass"
+path = "src/main.rs"
+
+[dependencies]
+gg-credentials.workspace = true

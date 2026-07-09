@@ -1,0 +1,35 @@
+# cargo-deny configuration.
+#
+# The licensing check is the one the spec flags as legal-sensitive: GPUI's
+# Apache-2.0 promise underpins distributing gittify under any license, but a
+# community report alleges a transitive GPL-3.0 link (sum_tree -> ztracing ->
+# zlog). This config denies copyleft licenses so that risk surfaces in CI the
+# moment the GPUI git dependency is added, rather than after release.
+
+[licenses]
+allow = [
+    # The project's own license (workspace crates only; dependencies stay
+    # under the permissive licenses below).
+    "PolyForm-Noncommercial-1.0.0",
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "CC0-1.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+
+[advisories]
+yanked = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "allow" # GPUI is pinned via a Zed git dependency.

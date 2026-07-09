@@ -1,0 +1,28 @@
+[package]
+name = "gittify-egui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "egui desktop front-end for gittify."
+
+[[bin]]
+name = "gittify-egui"
+path = "src/main.rs"
+
+[dependencies]
+gg-core.workspace = true
+gg-graph.workspace = true
+gg-diff.workspace = true
+gg-git.workspace = true
+gg-app.workspace = true
+gg-ui-traits.workspace = true
+eframe = "0.32.3"
+egui = "0.32.3"
+rfd = "0.17.2"
+# Blocks a worker thread on rfd's async dialogs (which dispatch to the main
+# thread on macOS, where the sync dialogs are main-thread-only).
+pollster = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

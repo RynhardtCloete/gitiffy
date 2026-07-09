@@ -1,0 +1,24 @@
+[package]
+name = "gittify-bin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "gittify entry point (selects a UI backend; ships a CLI graph renderer)."
+
+[[bin]]
+name = "gittify"
+path = "src/main.rs"
+
+[dependencies]
+gg-core.workspace = true
+gg-git.workspace = true
+gg-graph.workspace = true
+
+[features]
+default = []
+# UI backends live in excluded crates and pull heavy graphics stacks; they are
+# opt-in lanes, wired here once those crates are built in CI.
+ui-gpui = []
+ui-egui = []

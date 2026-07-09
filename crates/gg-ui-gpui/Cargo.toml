@@ -1,0 +1,23 @@
+[package]
+name = "gg-ui-gpui"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "PolyForm-Noncommercial-1.0.0"
+description = "GPUI implementation of the gittify UI traits (primary backend)."
+
+# NOTE: excluded from the default workspace build (see root Cargo.toml). GPUI
+# has no stable crates.io release line; standalone apps pin a git dependency on
+# the Zed monorepo. Phase 0 of the plan stands this up behind a decision gate
+# and runs `cargo deny` for the Apache-2.0 / GPL-3.0 licensing check before any
+# application code commits to it.
+#
+# [dependencies]
+# gpui = { git = "https://github.com/zed-industries/zed", package = "gpui" }
+# gpui-component = { git = "https://github.com/longbridge/gpui-component" }
+
+[dependencies]
+gg-core = { path = "../gg-core" }
+gg-graph = { path = "../gg-graph" }
+gg-ui-traits = { path = "../gg-ui-traits" }
+gg-app = { path = "../gg-app" }

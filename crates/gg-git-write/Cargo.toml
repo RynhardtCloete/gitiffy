@@ -1,0 +1,12 @@
+[package]
+name = "gg-git-write"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Write path: system git via subprocess behind the RepoWriter trait."
+
+[dependencies]
+gg-core.workspace = true
+which.workspace = true

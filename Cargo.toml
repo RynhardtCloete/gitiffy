@@ -1,0 +1,54 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gg-core",
+    "crates/gg-graph",
+    "crates/gg-diff",
+    "crates/gg-git-read",
+    "crates/gg-git-write",
+    "crates/gg-git",
+    "crates/gg-ui-traits",
+    "crates/gg-app",
+    "crates/gg-credentials",
+    "apps/gittify-bin",
+    "apps/gittify-egui",
+    "apps/gg-askpass",
+]
+# UI backend crates are excluded from the default build because they pull heavy,
+# pre-1.0 / platform-native graphics stacks (GPUI pins a git dependency on the
+# Zed monorepo). They are built explicitly via their own feature lanes in CI.
+exclude = [
+    "crates/gg-ui-gpui",
+    "crates/gg-ui-egui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "PolyForm-Noncommercial-1.0.0"
+authors = ["Rynhardt Cloete"]
+repository = "https://github.com/RynhardtCloete/gitiffy"
+
+[workspace.dependencies]
+# Internal crates
+gg-core = { path = "crates/gg-core" }
+gg-graph = { path = "crates/gg-graph" }
+gg-diff = { path = "crates/gg-diff" }
+gg-git-read = { path = "crates/gg-git-read" }
+gg-git-write = { path = "crates/gg-git-write" }
+gg-git = { path = "crates/gg-git" }
+gg-ui-traits = { path = "crates/gg-ui-traits" }
+gg-app = { path = "crates/gg-app" }
+gg-credentials = { path = "crates/gg-credentials" }
+
+# Shared third-party deps (pinned thinly; bump on a schedule per plan rec #4)
+thiserror = "2"
+anyhow = "1"
+which = "7"
+crossbeam-channel = "0.5"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

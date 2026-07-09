@@ -1,0 +1,13 @@
+[package]
+name = "gg-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Application state, async orchestration, and command dispatch."
+
+[dependencies]
+gg-core.workspace = true
+gg-git.workspace = true
+crossbeam-channel.workspace = true

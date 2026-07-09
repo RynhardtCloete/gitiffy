@@ -1,0 +1,11 @@
+[package]
+name = "gg-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Renderer- and IO-free domain types shared across the gittify workspace."
+
+[dependencies]
+thiserror.workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "gg-git"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Facade composing the read and write engines behind one GitEngine."
+
+[dependencies]
+gg-core.workspace = true
+gg-git-read.workspace = true
+gg-git-write.workspace = true
+gg-graph.workspace = true
+gg-diff.workspace = true
+gg-credentials.workspace = true
+
+[dev-dependencies]
+gg-diff.workspace = true

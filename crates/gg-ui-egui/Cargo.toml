@@ -1,0 +1,19 @@
+[package]
+name = "gg-ui-egui"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "PolyForm-Noncommercial-1.0.0"
+description = "egui implementation of the gittify UI traits (the validated fallback backend)."
+
+# NOTE: this crate is intentionally excluded from the default workspace build
+# (see the root Cargo.toml `exclude` list). egui pulls a windowing/GPU stack we
+# do not want on every `cargo build`. CI builds it on a dedicated `ui-egui`
+# lane so the fallback never rots (spec recommendation #2).
+
+[dependencies]
+gg-core = { path = "../gg-core" }
+gg-graph = { path = "../gg-graph" }
+gg-ui-traits = { path = "../gg-ui-traits" }
+gg-app = { path = "../gg-app" }
+egui = "0.29"
