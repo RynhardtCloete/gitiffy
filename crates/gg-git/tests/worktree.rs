@@ -38,6 +38,9 @@ fn status_stage_diff_commit_roundtrip() {
     }
     let dir = unique_tmp();
     git(&dir, &["init", "-q", "-b", "main"]);
+    // Engine-spawned git needs an identity; CI runners have no global one.
+    git(&dir, &["config", "user.name", "Test"]);
+    git(&dir, &["config", "user.email", "test@example.com"]);
     std::fs::write(dir.join("tracked.txt"), "one\ntwo\nthree\n").unwrap();
     git(&dir, &["add", "."]);
     git(&dir, &["commit", "-q", "-m", "initial"]);

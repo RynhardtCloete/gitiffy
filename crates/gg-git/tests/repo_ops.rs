@@ -59,6 +59,9 @@ fn stash_list_apply_drop_pop() {
     let a = dir.join("a.txt");
     let b = dir.join("b.txt");
     git(&dir, &["init", "-q", "-b", "main"]);
+    // Engine-spawned git needs an identity; CI runners have no global one.
+    git(&dir, &["config", "user.name", "Test"]);
+    git(&dir, &["config", "user.email", "test@example.com"]);
     std::fs::write(&a, "a\n").unwrap();
     std::fs::write(&b, "b\n").unwrap();
     git(&dir, &["add", "."]);
@@ -122,6 +125,9 @@ fn remotes_add_list_remove() {
     }
     let dir = unique_tmp("remote");
     git(&dir, &["init", "-q", "-b", "main"]);
+    // Engine-spawned git needs an identity; CI runners have no global one.
+    git(&dir, &["config", "user.name", "Test"]);
+    git(&dir, &["config", "user.email", "test@example.com"]);
     let engine = GitEngine::discover(&dir).expect("open engine");
 
     assert!(engine.writer().remotes().unwrap().is_empty());
@@ -157,6 +163,9 @@ fn tag_create_and_delete() {
     }
     let dir = unique_tmp("tag");
     git(&dir, &["init", "-q", "-b", "main"]);
+    // Engine-spawned git needs an identity; CI runners have no global one.
+    git(&dir, &["config", "user.name", "Test"]);
+    git(&dir, &["config", "user.email", "test@example.com"]);
     std::fs::write(dir.join("f.txt"), "hi\n").unwrap();
     git(&dir, &["add", "."]);
     git(&dir, &["commit", "-q", "-m", "base"]);

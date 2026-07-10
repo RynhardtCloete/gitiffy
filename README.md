@@ -1,7 +1,6 @@
 # gittify
 
-A high-performance, cross-platform Git GUI in Rust. This repository implements
-the architecture in [`Spec Plan.md`](./Spec%20Plan.md): a **hybrid git engine**
+A high-performance, cross-platform Git GUI in Rust. A **hybrid git engine**
 (gitoxide for reads, system `git` for writes/network), a **renderer-independent,
 virtualized commit-graph layout engine**, and a **swappable UI layer** (GPUI
 primary, egui fallback) behind a thin rendering abstraction.

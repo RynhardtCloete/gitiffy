@@ -57,6 +57,9 @@ fn reset_revert_and_stash() {
     let dir = unique_tmp("rrs");
     let file = dir.join("f.txt");
     git(&dir, &["init", "-q", "-b", "main"]);
+    // Engine-spawned git needs an identity; CI runners have no global one.
+    git(&dir, &["config", "user.name", "Test"]);
+    git(&dir, &["config", "user.email", "test@example.com"]);
     std::fs::write(&file, "one\n").unwrap();
     git(&dir, &["add", "."]);
     git(&dir, &["commit", "-q", "-m", "A"]);
@@ -119,6 +122,9 @@ fn cherry_pick_across_branches() {
     let dir = unique_tmp("cp");
     let file = dir.join("f.txt");
     git(&dir, &["init", "-q", "-b", "main"]);
+    // Engine-spawned git needs an identity; CI runners have no global one.
+    git(&dir, &["config", "user.name", "Test"]);
+    git(&dir, &["config", "user.email", "test@example.com"]);
     std::fs::write(&file, "base\n").unwrap();
     git(&dir, &["add", "."]);
     git(&dir, &["commit", "-q", "-m", "base"]);
