@@ -21,6 +21,10 @@ allow = [
     "Unicode-3.0",
     "MPL-2.0",
     "CC0-1.0",
+    "BSL-1.0",
+    # Embedded default fonts in epaint (egui stack).
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
 ]
 confidence-threshold = 0.9
 
@@ -29,6 +33,17 @@ multiple-versions = "warn"
 
 [advisories]
 yanked = "deny"
+ignore = [
+    # DoS-class issues in quick-xml 0.39 (quadratic attribute checking, unbounded
+    # namespace allocation). Pulled in via eframe -> atspi -> zbus, which pins
+    # quick-xml 0.39; the fix (>= 0.41) lands when the egui stack bumps zbus.
+    # Only parses local D-Bus introspection XML on Linux, so exposure is minimal.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+    # ttf-parser is unmaintained (informational). Transitive via the egui font
+    # stack; revisit when egui migrates off it.
+    "RUSTSEC-2026-0192",
+]
 
 [sources]
 unknown-registry = "deny"

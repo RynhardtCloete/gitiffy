@@ -3783,7 +3783,7 @@ fn draw_header(ui: &egui::Ui, rect: egui::Rect, gutter: f32) {
             egui::pos2(rect.left(), rect.bottom() - 0.5),
             egui::pos2(rect.right(), rect.bottom() - 0.5),
         ],
-        egui::Stroke::new(1.0, Color32::from_gray(60)),
+        egui::Stroke::new(1.0_f32, Color32::from_gray(60)),
     );
 }
 
@@ -4000,7 +4000,7 @@ fn configure_style(ctx: &egui::Context) {
     v.extreme_bg_color = Color32::from_rgb(0x14, 0x15, 0x18);
     v.faint_bg_color = Color32::from_rgb(0x22, 0x24, 0x29);
     v.selection.bg_fill = Color32::from_rgb(0x2c, 0x44, 0x66);
-    v.selection.stroke = egui::Stroke::new(1.0, Color32::from_rgb(0x6f, 0xa8, 0xff));
+    v.selection.stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(0x6f, 0xa8, 0xff));
     v.hyperlink_color = Color32::from_rgb(0x6f, 0xa8, 0xff);
 
     let radius = egui::CornerRadius::same(6);
@@ -4017,9 +4017,9 @@ fn configure_style(ctx: &egui::Context) {
     v.widgets.inactive.weak_bg_fill = Color32::from_rgb(0x26, 0x29, 0x2f);
     v.widgets.hovered.bg_fill = Color32::from_rgb(0x33, 0x37, 0x3f);
     v.widgets.hovered.weak_bg_fill = Color32::from_rgb(0x33, 0x37, 0x3f);
-    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, Color32::from_rgb(0x4a, 0x50, 0x5c));
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(0x4a, 0x50, 0x5c));
     v.widgets.active.bg_fill = Color32::from_rgb(0x2c, 0x44, 0x66);
-    v.window_stroke = egui::Stroke::new(1.0, Color32::from_rgb(0x34, 0x38, 0x40));
+    v.window_stroke = egui::Stroke::new(1.0_f32, Color32::from_rgb(0x34, 0x38, 0x40));
     v.window_shadow = egui::Shadow {
         offset: [0, 6],
         blur: 18,
