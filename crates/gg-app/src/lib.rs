@@ -857,6 +857,11 @@ fn refresh_history(engine: &GitEngine, send: &impl Fn(Event), opts: &WalkOpts) {
             error: e.to_string(),
         }),
     }
+    // Whatever moved the history usually moved refs too (commit, merge,
+    // reset, …): refresh them together so ref pills never go stale.
+    if let Ok(refs) = engine.reader().refs() {
+        send(Event::Refs(refs));
+    }
 }
 
 /// Run a network op, forwarding progress as events and honoring cancellation.

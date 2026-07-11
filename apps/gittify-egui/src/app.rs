@@ -874,6 +874,23 @@ impl GittifyApp {
                         tab.loading_more = false;
                         // A short read means the walk hit the root: no more pages.
                         tab.history_complete = view.commits.len() < tab.requested_limit;
+                        // The selection is a row index; a refresh can shift
+                        // rows under it (a new commit inserts at the top).
+                        // Re-anchor it to the same commit id, or clear it if
+                        // that commit left the view (reset, amend).
+                        if let Some(i) = tab.selected_commit {
+                            let old_oid = tab
+                                .state
+                                .history
+                                .as_ref()
+                                .and_then(|v| v.commits.get(i))
+                                .map(|c| c.oid);
+                            tab.selected_commit = old_oid
+                                .and_then(|oid| view.commits.iter().position(|c| c.oid == oid));
+                            if tab.selected_commit.is_none() {
+                                tab.selected_commit_file = None;
+                            }
+                        }
                     }
                     Event::Refs(refs) => tab.labels = build_label_map(refs),
                     Event::Status(status) => {
