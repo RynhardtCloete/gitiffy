@@ -876,6 +876,30 @@ impl GittifyApp {
                         tab.history_complete = view.commits.len() < tab.requested_limit;
                     }
                     Event::Refs(refs) => tab.labels = build_label_map(refs),
+                    Event::Status(status) => {
+                        // The refreshed tree may no longer contain the
+                        // previewed file on the previewed side (committed,
+                        // discarded, fully staged): drop the stale selection
+                        // and its diff so the pane doesn't show a ghost.
+                        let stale = tab.selected_change.as_ref().is_some_and(|sel| {
+                            !status.entries.iter().any(|e| {
+                                e.path == sel.path
+                                    && if sel.staged {
+                                        e.is_staged()
+                                    } else {
+                                        e.has_unstaged()
+                                    }
+                            })
+                        });
+                        if stale {
+                            tab.selected_change = None;
+                            tab.state.diff = None;
+                            tab.diff_doc = None;
+                        }
+                        // Bulk-selection checkboxes for vanished paths too.
+                        tab.multi
+                            .retain(|p| status.entries.iter().any(|e| &e.path == p));
+                    }
                     Event::Diff { .. } => tab.diff_gen = tab.diff_gen.wrapping_add(1),
                     Event::CommitDiff { .. } => {
                         tab.commit_diff_gen = tab.commit_diff_gen.wrapping_add(1);
