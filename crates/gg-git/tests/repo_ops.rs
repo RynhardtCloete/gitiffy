@@ -62,6 +62,9 @@ fn stash_list_apply_drop_pop() {
     // Engine-spawned git needs an identity; CI runners have no global one.
     git(&dir, &["config", "user.name", "Test"]);
     git(&dir, &["config", "user.email", "test@example.com"]);
+    // Pin newline conversion off so byte-exact content asserts hold under
+    // the Windows runners' autocrlf=true default.
+    git(&dir, &["config", "core.autocrlf", "false"]);
     std::fs::write(&a, "a\n").unwrap();
     std::fs::write(&b, "b\n").unwrap();
     git(&dir, &["add", "."]);
@@ -128,6 +131,9 @@ fn remotes_add_list_remove() {
     // Engine-spawned git needs an identity; CI runners have no global one.
     git(&dir, &["config", "user.name", "Test"]);
     git(&dir, &["config", "user.email", "test@example.com"]);
+    // Pin newline conversion off so byte-exact content asserts hold under
+    // the Windows runners' autocrlf=true default.
+    git(&dir, &["config", "core.autocrlf", "false"]);
     let engine = GitEngine::discover(&dir).expect("open engine");
 
     assert!(engine.writer().remotes().unwrap().is_empty());
@@ -166,6 +172,9 @@ fn tag_create_and_delete() {
     // Engine-spawned git needs an identity; CI runners have no global one.
     git(&dir, &["config", "user.name", "Test"]);
     git(&dir, &["config", "user.email", "test@example.com"]);
+    // Pin newline conversion off so byte-exact content asserts hold under
+    // the Windows runners' autocrlf=true default.
+    git(&dir, &["config", "core.autocrlf", "false"]);
     std::fs::write(dir.join("f.txt"), "hi\n").unwrap();
     git(&dir, &["add", "."]);
     git(&dir, &["commit", "-q", "-m", "base"]);

@@ -60,6 +60,9 @@ fn reset_revert_and_stash() {
     // Engine-spawned git needs an identity; CI runners have no global one.
     git(&dir, &["config", "user.name", "Test"]);
     git(&dir, &["config", "user.email", "test@example.com"]);
+    // Pin newline conversion off so byte-exact content asserts hold under
+    // the Windows runners' autocrlf=true default.
+    git(&dir, &["config", "core.autocrlf", "false"]);
     std::fs::write(&file, "one\n").unwrap();
     git(&dir, &["add", "."]);
     git(&dir, &["commit", "-q", "-m", "A"]);
@@ -125,6 +128,9 @@ fn cherry_pick_across_branches() {
     // Engine-spawned git needs an identity; CI runners have no global one.
     git(&dir, &["config", "user.name", "Test"]);
     git(&dir, &["config", "user.email", "test@example.com"]);
+    // Pin newline conversion off so byte-exact content asserts hold under
+    // the Windows runners' autocrlf=true default.
+    git(&dir, &["config", "core.autocrlf", "false"]);
     std::fs::write(&file, "base\n").unwrap();
     git(&dir, &["add", "."]);
     git(&dir, &["commit", "-q", "-m", "base"]);

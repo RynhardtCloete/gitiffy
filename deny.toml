@@ -6,6 +6,20 @@
 # zlog). This config denies copyleft licenses so that risk surfaces in CI the
 # moment the GPUI git dependency is added, rather than after release.
 
+# Only audit the platforms gittify actually ships on. Without this,
+# cargo-deny walks the lockfile for every possible target, dragging in e.g.
+# muda's Linux GTK3 bindings (unmaintained-advisory noise) even though muda is
+# a macOS-only dependency here and the GTK path is never compiled.
+[graph]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+]
+
 [licenses]
 allow = [
     # The project's own license (workspace crates only; dependencies stay
@@ -43,6 +57,20 @@ ignore = [
     # ttf-parser is unmaintained (informational). Transitive via the egui font
     # stack; revisit when egui migrates off it.
     "RUSTSEC-2026-0192",
+    # Unmaintained gtk-rs GTK3 bindings (and their proc-macro-error helper).
+    # These are muda's *Linux* dependencies; we depend on muda only on macOS
+    # (native menu bar), so this code is never compiled on any platform we
+    # ship. cargo-deny still walks the edges because it evaluates muda's
+    # target cfgs against every triple in [graph].targets. Drop these when
+    # muda moves its Linux backend off GTK3.
+    "RUSTSEC-2024-0370",
+    "RUSTSEC-2024-0412",
+    "RUSTSEC-2024-0413",
+    "RUSTSEC-2024-0415",
+    "RUSTSEC-2024-0416",
+    "RUSTSEC-2024-0418",
+    "RUSTSEC-2024-0419",
+    "RUSTSEC-2024-0420",
 ]
 
 [sources]

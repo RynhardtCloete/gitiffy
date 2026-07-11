@@ -41,6 +41,9 @@ fn status_stage_diff_commit_roundtrip() {
     // Engine-spawned git needs an identity; CI runners have no global one.
     git(&dir, &["config", "user.name", "Test"]);
     git(&dir, &["config", "user.email", "test@example.com"]);
+    // Pin newline conversion off so byte-exact content asserts hold under
+    // the Windows runners' autocrlf=true default.
+    git(&dir, &["config", "core.autocrlf", "false"]);
     std::fs::write(dir.join("tracked.txt"), "one\ntwo\nthree\n").unwrap();
     git(&dir, &["add", "."]);
     git(&dir, &["commit", "-q", "-m", "initial"]);
