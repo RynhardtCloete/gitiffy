@@ -19,6 +19,11 @@ pub struct WsNode {
     /// Repo tabs open in this workspace, in tab order.
     #[serde(default)]
     pub repos: Vec<PathBuf>,
+    /// Repos available in this workspace's library (shown on the landing
+    /// page; a superset of the open tabs). The same path may appear in
+    /// several workspaces' libraries.
+    #[serde(default)]
+    pub library: Vec<PathBuf>,
     /// Nested child workspaces.
     #[serde(default)]
     pub children: Vec<WsNode>,
@@ -41,9 +46,17 @@ impl WsNode {
             id,
             name: name.into(),
             repos: Vec::new(),
+            library: Vec::new(),
             children: Vec::new(),
             active_tab: 0,
             expanded: true,
+        }
+    }
+
+    /// Add `path` to this workspace's library (deduplicated).
+    pub fn add_to_library(&mut self, path: &Path) {
+        if !self.library.iter().any(|p| p == path) {
+            self.library.push(path.to_path_buf());
         }
     }
 }
@@ -58,6 +71,9 @@ pub struct WorkspaceStore {
     /// Next id to hand out (kept ahead of every existing id).
     #[serde(default)]
     pub next_id: u64,
+    /// Most-recently-opened repos across all workspaces, newest first.
+    #[serde(default)]
+    pub recent: Vec<PathBuf>,
 }
 
 impl Default for WorkspaceStore {
@@ -70,11 +86,13 @@ impl WorkspaceStore {
     /// A fresh store with a single "Workspace" holding `repos`.
     pub fn with_repos(repos: Vec<PathBuf>) -> Self {
         let mut root = WsNode::new(1, "Workspace");
+        root.library = repos.clone();
         root.repos = repos;
         Self {
             active: 1,
             roots: vec![root],
             next_id: 2,
+            recent: Vec::new(),
         }
     }
 
@@ -96,6 +114,19 @@ impl WorkspaceStore {
         if find(&self.roots, self.active).is_none() {
             self.active = self.roots[0].id;
         }
+        // Stores from before the library existed: every open tab is at least
+        // available in its workspace's library.
+        seed_library(&mut self.roots);
+    }
+
+    /// How many recently-opened entries are kept.
+    pub const MAX_RECENT: usize = 10;
+
+    /// Record `path` as the most recently opened repo (dedupes, caps).
+    pub fn touch_recent(&mut self, path: &Path) {
+        self.recent.retain(|p| p != path);
+        self.recent.insert(0, path.to_path_buf());
+        self.recent.truncate(Self::MAX_RECENT);
     }
 
     pub fn find(&self, id: u64) -> Option<&WsNode> {
@@ -147,12 +178,25 @@ impl WorkspaceStore {
         find(&self.roots, ancestor).is_some_and(|a| contains(a, id))
     }
 
-    /// Move `id` to be a child of `new_parent` (or a top-level node when
-    /// `None`). No-op if it would create a cycle or the node is missing.
-    pub fn reparent(&mut self, id: u64, new_parent: Option<u64>, index: usize) {
+    /// The parent id (`None` = top level) and sibling index of `id`.
+    pub fn locate(&self, id: u64) -> Option<(Option<u64>, usize)> {
+        locate(&self.roots, None, id)
+    }
+
+    /// Move `id` so it sits under `new_parent` at sibling position `index`,
+    /// where `index` is interpreted against the sibling list as it looks
+    /// *before* the move (so reordering within one parent lands where the
+    /// user aimed). No-op on cycles or a missing node.
+    pub fn move_to(&mut self, id: u64, new_parent: Option<u64>, mut index: usize) {
         if let Some(p) = new_parent {
             if p == id || self.is_descendant(id, p) {
                 return; // cycle
+            }
+        }
+        if let Some((old_parent, old_index)) = self.locate(id) {
+            // Removing the node first shifts later siblings down by one.
+            if old_parent == new_parent && old_index < index {
+                index -= 1;
             }
         }
         if let Some(node) = self.remove(id) {
@@ -193,6 +237,28 @@ fn find_mut(nodes: &mut [WsNode], id: u64) -> Option<&mut WsNode> {
         }
         if let Some(f) = find_mut(&mut n.children, id) {
             return Some(f);
+        }
+    }
+    None
+}
+
+fn seed_library(nodes: &mut [WsNode]) {
+    for n in nodes {
+        let open: Vec<PathBuf> = n.repos.clone();
+        for path in open {
+            n.add_to_library(&path);
+        }
+        seed_library(&mut n.children);
+    }
+}
+
+fn locate(nodes: &[WsNode], parent: Option<u64>, id: u64) -> Option<(Option<u64>, usize)> {
+    for (i, n) in nodes.iter().enumerate() {
+        if n.id == id {
+            return Some((parent, i));
+        }
+        if let Some(found) = locate(&n.children, Some(n.id), id) {
+            return Some(found);
         }
     }
     None
@@ -239,6 +305,7 @@ mod tests {
                 ..WsNode::new(1, "root")
             }],
             next_id: 0,
+            recent: Vec::new(),
         };
         store.normalize();
         store
@@ -271,7 +338,7 @@ mod tests {
         assert!(store.is_descendant(1, 4));
         assert!(!store.is_descendant(3, 4));
         // Reparenting a node into its own descendant is a no-op (no cycle).
-        store.reparent(2, Some(4), 0);
+        store.move_to(2, Some(4), 0);
         assert!(store.find(2).is_some());
         assert!(store.is_descendant(2, 4), "tree must be unchanged");
     }
@@ -279,10 +346,101 @@ mod tests {
     #[test]
     fn reparent_moves_subtree() {
         let mut store = sample();
-        store.reparent(2, Some(3), 0); // move a (with c) under b
+        store.move_to(2, Some(3), 0); // move a (with c) under b
         assert!(store.find(3).unwrap().children.iter().any(|n| n.id == 2));
         assert!(store.is_descendant(2, 4)); // c still under a
         assert_eq!(store.roots[0].children.len(), 1); // only b remains at root level
+    }
+
+    #[test]
+    fn locate_finds_parent_and_index() {
+        let store = sample();
+        assert_eq!(store.locate(1), Some((None, 0)));
+        assert_eq!(store.locate(2), Some((Some(1), 0)));
+        assert_eq!(store.locate(3), Some((Some(1), 1)));
+        assert_eq!(store.locate(4), Some((Some(2), 0)));
+        assert_eq!(store.locate(99), None);
+    }
+
+    #[test]
+    fn move_to_reorders_within_a_parent() {
+        // Move a(2) after b(3): aiming at pre-move index 2 lands it last.
+        let mut store = sample();
+        store.move_to(2, Some(1), 2);
+        let kids: Vec<u64> = store
+            .find(1)
+            .unwrap()
+            .children
+            .iter()
+            .map(|n| n.id)
+            .collect();
+        assert_eq!(kids, vec![3, 2]);
+        // And back before b(3).
+        store.move_to(2, Some(1), 0);
+        let kids: Vec<u64> = store
+            .find(1)
+            .unwrap()
+            .children
+            .iter()
+            .map(|n| n.id)
+            .collect();
+        assert_eq!(kids, vec![2, 3]);
+    }
+
+    #[test]
+    fn move_to_promotes_to_top_level_at_position() {
+        let mut store = sample();
+        store.move_to(4, None, 0); // c out of a, to the front of the roots
+        assert_eq!(store.roots[0].id, 4);
+        assert!(store.find(2).unwrap().children.is_empty());
+        store.move_to(4, Some(1), usize::MAX); // and back under root, last
+        assert_eq!(store.find(1).unwrap().children.last().unwrap().id, 4);
+    }
+
+    #[test]
+    fn move_to_refuses_cycles() {
+        let mut store = sample();
+        store.move_to(2, Some(4), 0); // a into its own descendant c
+        assert_eq!(store.locate(2), Some((Some(1), 0)), "tree unchanged");
+    }
+
+    #[test]
+    fn touch_recent_dedupes_orders_and_caps() {
+        let mut store = WorkspaceStore::default();
+        for i in 0..12 {
+            store.touch_recent(Path::new(&format!("/r{i}")));
+        }
+        assert_eq!(store.recent.len(), WorkspaceStore::MAX_RECENT);
+        assert_eq!(store.recent[0], PathBuf::from("/r11"));
+        // Re-touching moves to the front without duplicating.
+        store.touch_recent(Path::new("/r5"));
+        assert_eq!(store.recent[0], PathBuf::from("/r5"));
+        assert_eq!(
+            store
+                .recent
+                .iter()
+                .filter(|p| p.as_path() == Path::new("/r5"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn normalize_seeds_library_from_open_tabs() {
+        let mut store = WorkspaceStore::with_repos(vec![PathBuf::from("/x")]);
+        store.roots[0].library.clear(); // simulate a pre-library store
+        store.roots[0].children.push(WsNode {
+            repos: vec![PathBuf::from("/y")],
+            ..WsNode::new(7, "child")
+        });
+        store.normalize();
+        assert!(store.roots[0].library.contains(&PathBuf::from("/x")));
+        assert!(store.roots[0].children[0]
+            .library
+            .contains(&PathBuf::from("/y")));
+        // Idempotent: normalizing again doesn't duplicate.
+        store.normalize();
+        assert_eq!(store.roots[0].library.len(), 1);
     }
 
     #[test]
@@ -308,6 +466,7 @@ mod tests {
             active: 999,
             roots: vec![],
             next_id: 0,
+            recent: Vec::new(),
         };
         store.normalize();
         assert!(!store.roots.is_empty());

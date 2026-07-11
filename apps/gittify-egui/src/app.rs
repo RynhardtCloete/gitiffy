@@ -1,14 +1,18 @@
 //! The eframe application: a Fork-style repository workspace.
 //!
 //! Fixed-size repository tabs run along the very top (persisted per
-//! workspace), with a captioned ribbon of tool groups (Repository / View /
-//! Branch / Sync / Stash) beneath them and a filterable branches / remotes /
-//! tags / stashes sidebar on the left. Each repo has two views, switched in
-//! the ribbon:
+//! workspace) with the workspace selector pinned top-right, a captioned
+//! ribbon of tool groups (Repository / Branch / Sync / Stash, plus an
+//! "Open in" menu) beneath them, and a collapsible sidebar on the left
+//! holding the view switch (Local Changes / All Commits) and the filterable
+//! branches / remotes / tags / stashes tree. The two views:
 //!
 //! * **History** — the commit graph + log as aligned columns (graph, subject
 //!   with ref pills, author, date, short SHA), rendered through the shared
-//!   layout engine and `draw_row`.
+//!   layout engine and `draw_row`. Selecting a commit minifies the table into
+//!   a left-hand strip and gives the rest of the window to the commit's
+//!   files (a tab strip) over a full-size diff; clicking the commit again
+//!   restores the full table.
 //! * **Changes** — the working tree: staged / unstaged / untracked files with
 //!   stage, unstage, and discard actions; a live diff preview; and a commit box
 //!   (title + description) with Commit and Commit & Push.
@@ -24,7 +28,7 @@ use gg_core::{
     ChangeKind, CommitMeta, FileChange, FileDiff, LineKind, Oid, RefKind, RefRecord, StatusEntry,
     Time,
 };
-use gg_git::{CommitOpts, ResetMode, WalkOpts};
+use gg_git::{CommitOpts, Credentials, ResetMode, WalkOpts};
 use gg_ui_traits::{draw_row, GraphMetrics, Viewport};
 
 use crate::canvas::EguiCanvas;
@@ -68,6 +72,8 @@ mod icon {
     pub const REMOTE: &str = "⬇";
     pub const REMOVE: &str = "🗙";
     pub const CARET_DOWN: &str = "⏷";
+    pub const CARET_LEFT: &str = "⏴";
+    pub const CARET_RIGHT: &str = "⏵";
     pub const DOT: &str = "•";
     pub const ARROW: &str = "»";
     pub const TAG: &str = "🏷";
@@ -108,6 +114,7 @@ enum BranchCmd {
 }
 
 /// A network operation chosen from the ribbon.
+#[derive(Clone)]
 enum NetCmd {
     /// Fetch from the derived (upstream/origin/first) remote.
     Fetch,
@@ -129,6 +136,10 @@ struct SidebarOut {
     /// Open the create-tag dialog: `Some(target)` where the inner `None`
     /// targets HEAD.
     tag_dialog_at: Option<Option<String>>,
+    /// Collapse the sidebar to its thin rail (the embedded ⏴ button).
+    collapse: bool,
+    /// Switch the repo view (the Local Changes / All Commits section).
+    set_view: Option<View>,
 }
 
 /// A stash operation chosen from the toolbar stash menu.
@@ -141,6 +152,73 @@ enum StashCmd {
     Pop(usize),
     /// Drop a stash.
     Drop(usize),
+}
+
+/// What a pending folder-picker result is for.
+#[derive(Clone, Copy)]
+enum PickFor {
+    /// Add an existing repository as a tab.
+    AddExisting,
+    /// Destination parent folder for a clone.
+    CloneDest,
+    /// Parent folder for a new (`git init`) repository.
+    InitParent,
+    /// Root folder to scan for repositories (bulk add).
+    ScanRoot,
+}
+
+/// Modal for cloning a remote repository: URL + destination folder. The
+/// clone itself runs on a background thread.
+struct CloneDialog {
+    url: String,
+    dest: Option<PathBuf>,
+    /// In-flight clone; the cloned path (or git's stderr) arrives here.
+    rx: Option<std::sync::mpsc::Receiver<Result<PathBuf, String>>>,
+    error: Option<String>,
+    /// A previous attempt failed for lack of credentials: show the
+    /// username/secret fields and retry with them.
+    need_auth: bool,
+    username: String,
+    password: String,
+}
+
+/// Credential prompt shown when a repository's network operation fails
+/// because git found no credentials (no helper configured, nothing cached).
+/// Submitting routes the credentials through the `gg-askpass` helper and
+/// retries the failed operation.
+struct AuthDialog {
+    /// Pool index of the repo whose operation failed.
+    repo: usize,
+    /// The failed operation, retried on submit.
+    retry: NetCmd,
+    /// Operation label ("Pull", "Push", …) for the dialog text.
+    label: String,
+    username: String,
+    password: String,
+}
+
+/// Modal for initializing a brand-new repository: parent folder + name.
+struct InitDialog {
+    parent: Option<PathBuf>,
+    name: String,
+    error: Option<String>,
+}
+
+/// One repository found by a folder scan, with its bulk-add checkbox state.
+struct ScanEntry {
+    path: PathBuf,
+    checked: bool,
+    /// Already in the active workspace's library (shown, but not re-added).
+    already: bool,
+}
+
+/// Modal for bulk-adding repositories discovered under a scanned folder. The
+/// filesystem walk runs on a background thread.
+struct ScanDialog {
+    root: PathBuf,
+    /// In-flight scan; the discovered repo paths arrive here.
+    rx: Option<std::sync::mpsc::Receiver<Vec<PathBuf>>>,
+    found: Vec<ScanEntry>,
 }
 
 /// A modal for creating a tag at a commit (or HEAD).
@@ -257,6 +335,9 @@ struct RepoTab {
     loading_more: bool,
     /// Sidebar filter text (matches branches, tags, remotes, stashes).
     sidebar_filter: String,
+    /// The most recent network op, kept for a credential-prompt retry until
+    /// it completes.
+    pending_net: Option<NetCmd>,
 }
 
 impl RepoTab {
@@ -306,6 +387,7 @@ impl RepoTab {
             history_complete: false,
             loading_more: false,
             sidebar_filter: String::new(),
+            pending_net: None,
         })
     }
 
@@ -352,6 +434,18 @@ pub struct GittifyApp {
     tag_dialog: Option<TagDialog>,
     /// Open remotes-management dialog, if any.
     remotes_dialog: Option<RemotesDialog>,
+    /// Open clone-repository dialog, if any.
+    clone_dialog: Option<CloneDialog>,
+    /// Open new-repository (git init) dialog, if any.
+    init_dialog: Option<InitDialog>,
+    /// Open credential prompt for a failed network op, if any.
+    auth_dialog: Option<AuthDialog>,
+    /// Open scan-folder (bulk add) dialog, if any.
+    scan_dialog: Option<ScanDialog>,
+    /// Landing page state (library list, README preview).
+    home: crate::home::HomeState,
+    /// The Home tab is selected (also forced when no repo tabs are open).
+    home_selected: bool,
     /// Whether the operation-details (progress log) window is open.
     show_op_details: bool,
     /// Whether the manage-workspaces settings modal is open.
@@ -361,17 +455,22 @@ pub struct GittifyApp {
     styled: bool,
     /// Whether the left repository sidebar is shown.
     show_sidebar: bool,
-    /// Pending async folder-picker result (the dialog runs on its own thread so
-    /// it never blocks the UI).
-    picker_rx: Option<std::sync::mpsc::Receiver<Option<PathBuf>>>,
+    /// Pending async folder-picker result and what it is for (the dialog runs
+    /// on its own thread so it never blocks the UI).
+    picker_rx: Option<(PickFor, std::sync::mpsc::Receiver<Option<PathBuf>>)>,
     /// The egui context, captured on the first frame; used to build worker
     /// wakers and to repaint when the folder picker resolves.
     ui_ctx: Option<egui::Context>,
+    /// The native macOS menu bar; `None` if it failed to build.
+    #[cfg(target_os = "macos")]
+    menubar: Option<crate::menubar::MenuBar>,
 }
 
 impl GittifyApp {
     /// Build the app, loading the persisted workspace tree.
-    pub fn new() -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        #[cfg(not(target_os = "macos"))]
+        let _ = cc;
         Self {
             workspaces: config::load_workspaces(),
             repos: Vec::new(),
@@ -381,6 +480,12 @@ impl GittifyApp {
             branch_dialog: None,
             tag_dialog: None,
             remotes_dialog: None,
+            clone_dialog: None,
+            init_dialog: None,
+            auth_dialog: None,
+            scan_dialog: None,
+            home: crate::home::HomeState::default(),
+            home_selected: false,
             show_op_details: false,
             settings_open: false,
             ws_rename: None,
@@ -388,6 +493,92 @@ impl GittifyApp {
             show_sidebar: true,
             picker_rx: None,
             ui_ctx: None,
+            #[cfg(target_os = "macos")]
+            menubar: crate::menubar::MenuBar::install(cc.egui_ctx.clone()),
+        }
+    }
+
+    /// Apply one command chosen from the native macOS menu bar.
+    #[cfg(target_os = "macos")]
+    fn apply_menu_action(&mut self, ctx: &egui::Context, action: crate::menubar::MenuAction) {
+        use crate::menubar::MenuAction;
+        match action {
+            // Edit verbs translate back into the egui events their shortcuts
+            // would have produced (the menu consumed the keystroke).
+            MenuAction::EditUndo => inject_key(ctx, egui::Key::Z, egui::Modifiers::COMMAND),
+            MenuAction::EditRedo => inject_key(
+                ctx,
+                egui::Key::Z,
+                egui::Modifiers::COMMAND | egui::Modifiers::SHIFT,
+            ),
+            MenuAction::EditCut => ctx.input_mut(|i| i.events.push(egui::Event::Cut)),
+            MenuAction::EditCopy => ctx.input_mut(|i| i.events.push(egui::Event::Copy)),
+            MenuAction::EditPaste => {
+                if let Ok(text) = arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+                    ctx.input_mut(|i| i.events.push(egui::Event::Paste(text)));
+                }
+            }
+            MenuAction::EditSelectAll => inject_key(ctx, egui::Key::A, egui::Modifiers::COMMAND),
+            MenuAction::AddRepository => self.pick_and_add(),
+            MenuAction::CloneRepository => self.open_clone_dialog(),
+            MenuAction::NewRepository => self.open_init_dialog(),
+            MenuAction::CloseRepository => {
+                if let Some(i) = self.workspaces.active_node().map(|w| w.active_tab) {
+                    self.close_tab(i);
+                }
+            }
+            MenuAction::Refresh => {
+                if let Some(sel) = self.active_index() {
+                    self.repos[sel].reload();
+                }
+            }
+            MenuAction::ToggleSidebar => self.show_sidebar = !self.show_sidebar,
+            MenuAction::ShowLocalChanges | MenuAction::ShowAllCommits => {
+                if let Some(sel) = self.active_index() {
+                    let tab = &mut self.repos[sel];
+                    if matches!(action, MenuAction::ShowLocalChanges) {
+                        tab.view = View::Changes;
+                        tab.handle.send(Command::LoadStatus);
+                    } else {
+                        tab.view = View::History;
+                    }
+                }
+            }
+            MenuAction::PreviousTab | MenuAction::NextTab => {
+                if let Some(ws) = self.workspaces.active_node_mut() {
+                    let n = ws.repos.len();
+                    if n > 0 {
+                        let step = if matches!(action, MenuAction::NextTab) {
+                            1
+                        } else {
+                            n - 1
+                        };
+                        ws.active_tab = (ws.active_tab + step) % n;
+                    }
+                }
+                self.persist();
+                self.sync_open_tabs();
+            }
+            MenuAction::OpenInTerminal => {
+                if let Some(tab) = self.active_index().and_then(|s| self.repos.get(s)) {
+                    open_in_terminal(&tab.path);
+                }
+            }
+            MenuAction::OpenInFileManager => {
+                if let Some(tab) = self.active_index().and_then(|s| self.repos.get(s)) {
+                    open_in_file_manager(&tab.path);
+                }
+            }
+            MenuAction::OpenInEditor => {
+                if let Some(tab) = self.active_index().and_then(|s| self.repos.get(s)) {
+                    open_in_editor(&tab.path);
+                }
+            }
+            MenuAction::Help => {
+                let _ = std::process::Command::new("open")
+                    .arg("https://github.com/RynhardtCloete/gitiffy")
+                    .spawn();
+            }
         }
     }
 
@@ -444,8 +635,8 @@ impl GittifyApp {
     }
 
     /// Open the native folder picker on a background thread; the chosen folder
-    /// is added when the result arrives (polled in `update`).
-    fn pick_and_add(&mut self) {
+    /// is routed by `purpose` when the result arrives (polled in `update`).
+    fn pick_folder(&mut self, purpose: PickFor) {
         if self.picker_rx.is_some() {
             return; // A picker is already open.
         }
@@ -461,19 +652,66 @@ impl GittifyApp {
                 ctx.request_repaint();
             }
         });
-        self.picker_rx = Some(rx);
+        self.picker_rx = Some((purpose, rx));
     }
 
-    /// Poll the async folder picker, adding the chosen repository if any.
+    /// Open the folder picker to add an existing repository.
+    fn pick_and_add(&mut self) {
+        self.pick_folder(PickFor::AddExisting);
+    }
+
+    /// Open the clone-repository dialog (no-op while a clone dialog exists,
+    /// so an in-flight clone is never clobbered).
+    fn open_clone_dialog(&mut self) {
+        if self.clone_dialog.is_none() {
+            self.clone_dialog = Some(CloneDialog {
+                url: String::new(),
+                dest: None,
+                rx: None,
+                error: None,
+                need_auth: false,
+                username: String::new(),
+                password: String::new(),
+            });
+        }
+    }
+
+    /// Open the new-repository (`git init`) dialog.
+    fn open_init_dialog(&mut self) {
+        if self.init_dialog.is_none() {
+            self.init_dialog = Some(InitDialog {
+                parent: None,
+                name: String::new(),
+                error: None,
+            });
+        }
+    }
+
+    /// Poll the async folder picker, routing the chosen folder to whichever
+    /// flow requested it.
     fn poll_picker(&mut self) {
-        let Some(rx) = &self.picker_rx else {
+        let Some((purpose, rx)) = &self.picker_rx else {
             return;
         };
+        let purpose = *purpose;
         match rx.try_recv() {
             Ok(dir) => {
                 self.picker_rx = None;
                 if let Some(dir) = dir {
-                    self.add_repo(dir);
+                    match purpose {
+                        PickFor::AddExisting => self.add_repo(dir),
+                        PickFor::CloneDest => {
+                            if let Some(d) = &mut self.clone_dialog {
+                                d.dest = Some(dir);
+                            }
+                        }
+                        PickFor::InitParent => {
+                            if let Some(d) = &mut self.init_dialog {
+                                d.parent = Some(dir);
+                            }
+                        }
+                        PickFor::ScanRoot => self.start_scan(dir),
+                    }
                 }
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => self.picker_rx = None,
@@ -481,10 +719,52 @@ impl GittifyApp {
         }
     }
 
+    /// Kick off a background scan of `root` for repositories to bulk-add.
+    fn start_scan(&mut self, root: PathBuf) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = self.ui_ctx.clone();
+        let walk_root = root.clone();
+        std::thread::spawn(move || {
+            let mut found = Vec::new();
+            scan_for_repos(&walk_root, SCAN_DEPTH, &mut found);
+            let _ = tx.send(found);
+            if let Some(ctx) = ctx {
+                ctx.request_repaint();
+            }
+        });
+        self.scan_dialog = Some(ScanDialog {
+            root,
+            rx: Some(rx),
+            found: Vec::new(),
+        });
+    }
+
+    /// Apply one action requested by the landing page.
+    fn apply_home_action(&mut self, action: crate::home::HomeAction) {
+        use crate::home::HomeAction;
+        match action {
+            HomeAction::Open(path) => self.add_repo(path),
+            HomeAction::Remove(path) => {
+                if let Some(ws) = self.workspaces.active_node_mut() {
+                    ws.library.retain(|p| p != &path);
+                }
+                if self.home.selected.as_ref() == Some(&path) {
+                    self.home.selected = None;
+                }
+                self.persist();
+            }
+            HomeAction::AddExisting => self.pick_and_add(),
+            HomeAction::Clone => self.open_clone_dialog(),
+            HomeAction::Init => self.open_init_dialog(),
+            HomeAction::Scan => self.pick_folder(PickFor::ScanRoot),
+        }
+    }
+
     /// Add a repo as a tab in the active workspace (and make it active).
     fn add_repo(&mut self, path: PathBuf) {
         self.add_error = None;
         if let Some(ws) = self.workspaces.active_node_mut() {
+            ws.add_to_library(&path);
             if let Some(i) = ws.repos.iter().position(|p| p == &path) {
                 ws.active_tab = i;
             } else {
@@ -492,8 +772,11 @@ impl GittifyApp {
                 ws.active_tab = ws.repos.len() - 1;
             }
         }
+        self.workspaces.touch_recent(&path);
         self.ensure_open(&path);
         self.persist();
+        // Opening a repo always brings its tab to the front, over Home.
+        self.home_selected = false;
     }
 
     /// Close the tab at `tab_index` in the active workspace.
@@ -507,6 +790,23 @@ impl GittifyApp {
             }
         }
         self.persist();
+    }
+
+    /// Start a network operation on the given repo, remembering it so a
+    /// credential prompt can retry it.
+    fn dispatch_net(&mut self, sel: usize, nc: NetCmd) {
+        let tab = &mut self.repos[sel];
+        tab.pending_net = Some(nc.clone());
+        let remote = derive_remote(&tab.state).unwrap_or_else(|| "origin".to_string());
+        let (cmd, label) = match nc {
+            NetCmd::Fetch => (Command::Fetch(remote), "Fetch"),
+            NetCmd::FetchRemote(r) => (Command::Fetch(r), "Fetch"),
+            NetCmd::Pull => (Command::Pull(remote), "Pull"),
+            NetCmd::Push => (Command::PushCurrent { force: false }, "Push"),
+            NetCmd::PushForce => (Command::PushCurrent { force: true }, "Push (force)"),
+        };
+        tab.start_op(label);
+        tab.handle.send(cmd);
     }
 
     /// Dispatch a branch/tag/remotes action collected from the toolbar menu or
@@ -563,7 +863,9 @@ impl GittifyApp {
     }
 
     fn drain_events(&mut self) {
-        for tab in &mut self.repos {
+        // A credential prompt to open once the borrow of `repos` ends.
+        let mut auth_req: Option<AuthDialog> = None;
+        for (repo_idx, tab) in self.repos.iter_mut().enumerate() {
             let events = tab.handle.poll_events();
             for ev in events {
                 match &ev {
@@ -586,12 +888,26 @@ impl GittifyApp {
                             tab.amend = false;
                         }
                         tab.busy = None;
+                        tab.pending_net = None;
                     }
-                    Event::Failed { label, .. } => {
+                    Event::Failed { label, error } => {
                         if label == "load-history" {
                             tab.loading = false;
                         }
                         tab.busy = None;
+                        // A network op that died for lack of credentials gets
+                        // the normal username/password prompt and a retry.
+                        if let Some(nc) = tab.pending_net.take() {
+                            if is_auth_error(error) && askpass_helper().is_some() {
+                                auth_req = Some(AuthDialog {
+                                    repo: repo_idx,
+                                    retry: nc,
+                                    label: label.clone(),
+                                    username: String::new(),
+                                    password: String::new(),
+                                });
+                            }
+                        }
                     }
                     // Raw git output lines feed the operation-details transcript
                     // (progress meters drive the bar via Event::Progress instead).
@@ -606,6 +922,9 @@ impl GittifyApp {
                 }
                 tab.state.apply(ev);
             }
+        }
+        if self.auth_dialog.is_none() {
+            self.auth_dialog = auth_req;
         }
     }
 }
@@ -623,10 +942,41 @@ impl eframe::App for GittifyApp {
         self.sync_open_tabs();
         self.drain_events();
 
+        // Native menu-bar picks (macOS).
+        #[cfg(target_os = "macos")]
+        {
+            let mut actions = Vec::new();
+            if let Some(mb) = &self.menubar {
+                while let Some(action) = mb.poll() {
+                    actions.push(action);
+                }
+            }
+            for action in actions {
+                self.apply_menu_action(ctx, action);
+            }
+        }
+
+        // Fullscreen toggle: macOS gets the system Ctrl+Cmd+F through the View
+        // menu's native fullscreen item, so the in-app shortcut only backstops
+        // a failed menu install; other platforms use the conventional F11.
+        #[cfg(target_os = "macos")]
+        let toggle_fs = self.menubar.is_none()
+            && ctx
+                .input(|i| i.modifiers.mac_cmd && i.modifiers.ctrl && i.key_pressed(egui::Key::F));
+        #[cfg(not(target_os = "macos"))]
+        let toggle_fs = ctx.input(|i| i.key_pressed(egui::Key::F11));
+        if toggle_fs {
+            let fs = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fs));
+        }
+
         // --- tab bar: the workspace's repositories, topmost like a browser ---
         let mut tab_select: Option<usize> = None;
         let mut tab_close: Option<usize> = None;
         let mut want_add_tab = false;
+        let mut want_home = false;
+        let mut ws_select: Option<u64> = None;
+        let mut want_settings = false;
         egui::TopBottomPanel::top("tabbar")
             .exact_height(TAB_HEIGHT + 12.0)
             .show(ctx, |ui| {
@@ -639,6 +989,16 @@ impl eframe::App for GittifyApp {
                         .active_node()
                         .map(|w| (w.repos.clone(), w.active_tab))
                         .unwrap_or_default();
+                    // Pinned Home tab: the workspace's repository library.
+                    let home_active = self.home_selected || repos.is_empty();
+                    if ui
+                        .selectable_label(home_active, "  Home  ")
+                        .on_hover_text("This workspace's repository library")
+                        .clicked()
+                    {
+                        want_home = true;
+                    }
+                    ui.add_space(2.0);
                     for (i, path) in repos.iter().enumerate() {
                         let name = path
                             .file_name()
@@ -657,15 +1017,27 @@ impl eframe::App for GittifyApp {
                     {
                         want_add_tab = true;
                     }
-                    if repos.is_empty() {
-                        ui.weak("No repositories in this workspace.");
-                    }
+                    // Workspace selector, pinned to the window's top-right
+                    // corner (Fork keeps its account/workspace switch there).
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(6.0);
+                        workspace_dropdown(
+                            ui,
+                            &self.workspaces,
+                            &mut ws_select,
+                            &mut want_settings,
+                        );
+                    });
                 });
             });
+        if want_home {
+            self.home_selected = true;
+        }
         if let Some(i) = tab_select {
             if let Some(ws) = self.workspaces.active_node_mut() {
                 ws.active_tab = i;
             }
+            self.home_selected = false;
             self.persist();
         }
         if let Some(i) = tab_close {
@@ -677,6 +1049,9 @@ impl eframe::App for GittifyApp {
 
         // --- ribbon: captioned tool groups under the tabs ---
         let mut want_add = false;
+        let mut want_clone = false;
+        let mut want_init = false;
+        let mut want_scan = false;
         let mut want_refresh = false;
         let mut branch_cmd: Option<(usize, BranchCmd)> = None;
         let mut open_dialog: Option<BranchDialog> = None;
@@ -684,12 +1059,10 @@ impl eframe::App for GittifyApp {
         let mut stash_cmd: Option<StashCmd> = None;
         let mut want_cancel = false;
         let mut want_terminal = false;
+        let mut want_finder = false;
+        let mut want_editor = false;
         let mut want_details = false;
-        let mut ws_select: Option<u64> = None;
-        let mut want_settings = false;
-        let mut toggle_sidebar = false;
         let sel_opt = self.active_index();
-        let sidebar_on = self.show_sidebar;
         egui::TopBottomPanel::top("toolbar")
             .exact_height(60.0)
             .show(ctx, |ui| {
@@ -703,10 +1076,34 @@ impl eframe::App for GittifyApp {
                             |ui| {
                                 ui.set_min_width(220.0);
                                 if ui
-                                    .button(format!("{}  Add repository…", icon::ADD))
+                                    .button(format!("{}  Add existing repository…", icon::ADD))
                                     .clicked()
                                 {
                                     want_add = true;
+                                    ui.close();
+                                }
+                                if ui
+                                    .button(format!("{}  Clone repository…", icon::REMOTE))
+                                    .clicked()
+                                {
+                                    want_clone = true;
+                                    ui.close();
+                                }
+                                if ui
+                                    .button(format!("{}  New repository…", icon::FOLDER))
+                                    .clicked()
+                                {
+                                    want_init = true;
+                                    ui.close();
+                                }
+                                if ui
+                                    .button(format!(
+                                        "{}  Scan a folder for repositories…",
+                                        icon::REFRESH
+                                    ))
+                                    .clicked()
+                                {
+                                    want_scan = true;
                                     ui.close();
                                 }
                                 if ui
@@ -717,16 +1114,6 @@ impl eframe::App for GittifyApp {
                                     .clicked()
                                 {
                                     want_refresh = true;
-                                    ui.close();
-                                }
-                                if ui
-                                    .add_enabled(
-                                        has_repo,
-                                        egui::Button::new(">_  Open in terminal"),
-                                    )
-                                    .clicked()
-                                {
-                                    want_terminal = true;
                                     ui.close();
                                 }
                                 ui.separator();
@@ -752,23 +1139,6 @@ impl eframe::App for GittifyApp {
                     ui.separator();
                     if let Some(sel) = sel_opt {
                         let tab = &mut self.repos[sel];
-                        ribbon_group(ui, "View", |ui| {
-                            ui.selectable_value(&mut tab.view, View::History, "  History  ");
-                            if ui
-                                .selectable_value(&mut tab.view, View::Changes, "  Changes  ")
-                                .clicked()
-                            {
-                                tab.handle.send(Command::LoadStatus);
-                            }
-                            if ui
-                                .selectable_label(sidebar_on, "  Sidebar  ")
-                                .on_hover_text("Show or hide the repository sidebar")
-                                .clicked()
-                            {
-                                toggle_sidebar = true;
-                            }
-                        });
-                        ui.separator();
                         let (ahead, behind) = tab
                             .state
                             .status
@@ -857,17 +1227,34 @@ impl eframe::App for GittifyApp {
                         });
                         ui.separator();
                     }
-                    // Right side: workspace selector, then status (progress /
+                    // Right side: the "Open in" menu, then status (progress /
                     // changed count / errors) flowing leftward.
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(4.0);
-                        workspace_dropdown(
-                            ui,
-                            &self.workspaces,
-                            &mut ws_select,
-                            &mut want_settings,
-                        );
-                        ui.separator();
+                        if has_repo {
+                            ui.menu_button(
+                                format!("{}  Open in  {}", icon::PUSH, icon::CARET_DOWN),
+                                |ui| {
+                                    ui.set_min_width(180.0);
+                                    if ui.button(">_  Terminal").clicked() {
+                                        want_terminal = true;
+                                        ui.close();
+                                    }
+                                    if ui
+                                        .button(format!("{}  {}", icon::FOLDER, FILE_MANAGER_NAME))
+                                        .clicked()
+                                    {
+                                        want_finder = true;
+                                        ui.close();
+                                    }
+                                    if ui.button(format!("{}  Editor", icon::RENAME)).clicked() {
+                                        want_editor = true;
+                                        ui.close();
+                                    }
+                                },
+                            );
+                            ui.separator();
+                        }
                         if let Some(err) = &self.add_error {
                             ui.colored_label(Color32::from_rgb(0xff, 0x6b, 0x6b), err);
                         }
@@ -917,11 +1304,17 @@ impl eframe::App for GittifyApp {
                     });
                 });
             });
-        if toggle_sidebar {
-            self.show_sidebar = !self.show_sidebar;
-        }
         if want_add {
             self.pick_and_add();
+        }
+        if want_clone {
+            self.open_clone_dialog();
+        }
+        if want_init {
+            self.open_init_dialog();
+        }
+        if want_scan {
+            self.pick_folder(PickFor::ScanRoot);
         }
         if want_refresh {
             if let Some(sel) = self.active_index() {
@@ -942,17 +1335,7 @@ impl eframe::App for GittifyApp {
         self.apply_branch_cmd(branch_cmd);
         if let Some(nc) = net_cmd {
             if let Some(sel) = self.active_index() {
-                let tab = &mut self.repos[sel];
-                let remote = derive_remote(&tab.state).unwrap_or_else(|| "origin".to_string());
-                let (cmd, label) = match nc {
-                    NetCmd::Fetch => (Command::Fetch(remote), "Fetch"),
-                    NetCmd::FetchRemote(r) => (Command::Fetch(r), "Fetch"),
-                    NetCmd::Pull => (Command::Pull(remote), "Pull"),
-                    NetCmd::Push => (Command::PushCurrent { force: false }, "Push"),
-                    NetCmd::PushForce => (Command::PushCurrent { force: true }, "Push (force)"),
-                };
-                tab.start_op(label);
-                tab.handle.send(cmd);
+                self.dispatch_net(sel, nc);
             }
         }
         self.apply_stash_cmd(stash_cmd);
@@ -966,13 +1349,27 @@ impl eframe::App for GittifyApp {
                 open_in_terminal(&tab.path);
             }
         }
+        if want_finder {
+            if let Some(tab) = self.active_index().and_then(|s| self.repos.get(s)) {
+                open_in_file_manager(&tab.path);
+            }
+        }
+        if want_editor {
+            if let Some(tab) = self.active_index().and_then(|s| self.repos.get(s)) {
+                open_in_editor(&tab.path);
+            }
+        }
         if want_details {
             self.show_op_details = !self.show_op_details;
         }
 
-        // --- repository sidebar (branches / remotes / tags / stashes) ---
-        if self.show_sidebar {
-            if let Some(sel) = self.active_index() {
+        // Home showing? (Selected explicitly, or forced when no tabs exist.)
+        let show_home = self.home_selected || self.active_index().is_none();
+
+        // --- repository sidebar (view switch / branches / remotes / tags /
+        // stashes), collapsible to a thin rail via its own embedded button ---
+        if let Some(sel) = self.active_index().filter(|_| !show_home) {
+            if self.show_sidebar {
                 let mut out = SidebarOut::default();
                 egui::SidePanel::left("sidebar")
                     .resizable(true)
@@ -981,6 +1378,16 @@ impl eframe::App for GittifyApp {
                     .show(ctx, |ui| {
                         sidebar_ui(ui, sel, &mut self.repos[sel], &mut out);
                     });
+                if out.collapse {
+                    self.show_sidebar = false;
+                }
+                if let Some(view) = out.set_view {
+                    let tab = &mut self.repos[sel];
+                    tab.view = view;
+                    if matches!(view, View::Changes) {
+                        tab.handle.send(Command::LoadStatus);
+                    }
+                }
                 if let Some(dialog) = out.open_dialog {
                     self.branch_dialog = Some(dialog);
                 }
@@ -994,14 +1401,35 @@ impl eframe::App for GittifyApp {
                 }
                 self.apply_branch_cmd(out.branch_cmd);
                 self.apply_stash_cmd(out.stash_cmd);
+            } else {
+                egui::SidePanel::left("sidebar-rail")
+                    .resizable(false)
+                    .exact_width(30.0)
+                    .show(ctx, |ui| {
+                        ui.add_space(8.0);
+                        ui.vertical_centered(|ui| {
+                            if ui
+                                .small_button(icon::CARET_RIGHT)
+                                .on_hover_text("Expand the sidebar")
+                                .clicked()
+                            {
+                                self.show_sidebar = true;
+                            }
+                        });
+                    });
             }
         }
 
-        // --- selected commit detail (only meaningful in History view) ---
+        // --- selected commit detail (History view, only while a commit is
+        // selected; a second click on the commit hides it again) ---
         let active = self.active_index();
-        let show_detail = active
-            .map(|s| matches!(self.repos[s].view, View::History))
-            .unwrap_or(false);
+        let show_detail = !show_home
+            && active
+                .map(|s| {
+                    matches!(self.repos[s].view, View::History)
+                        && self.repos[s].selected_commit.is_some()
+                })
+                .unwrap_or(false);
         if show_detail {
             // Fixed height: compact by default, taller when the user expands the
             // full message via the panel's "Show more" caret (no manual drag).
@@ -1021,6 +1449,10 @@ impl eframe::App for GittifyApp {
         // --- modals ---
         self.confirm_discard_modal(ctx);
         self.confirm_reset_modal(ctx);
+        self.clone_dialog_modal(ctx);
+        self.init_dialog_modal(ctx);
+        self.auth_dialog_modal(ctx);
+        self.scan_dialog_modal(ctx);
         self.branch_dialog_modal(ctx);
         self.tag_dialog_modal(ctx);
         self.remotes_dialog_modal(ctx);
@@ -1043,16 +1475,21 @@ impl eframe::App for GittifyApp {
 
 impl GittifyApp {
     fn central_ui(&mut self, ui: &mut egui::Ui) {
-        let Some(sel) = self.active_index() else {
-            ui.centered_and_justified(|ui| {
-                ui.label(
-                    egui::RichText::new("Add a repository to get started.")
-                        .size(15.0)
-                        .color(Color32::from_gray(130)),
-                );
-            });
+        let sel = self.active_index();
+        if self.home_selected || sel.is_none() {
+            let mut actions = Vec::new();
+            self.home.ui(
+                ui,
+                self.workspaces.active_node(),
+                &self.workspaces.recent,
+                &mut actions,
+            );
+            for action in actions {
+                self.apply_home_action(action);
+            }
             return;
-        };
+        }
+        let sel = sel.expect("checked above");
         match self.repos[sel].view {
             View::History => self.graph_view(ui, sel),
             View::Changes => {
@@ -1163,6 +1600,462 @@ impl GittifyApp {
             self.confirm_reset = None;
         } else if cancel {
             self.confirm_reset = None;
+        }
+    }
+
+    /// Render the clone-repository dialog: URL + destination folder, with the
+    /// clone running on a background thread while the dialog shows progress.
+    fn clone_dialog_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.clone_dialog.take() else {
+            return;
+        };
+        // Resolve an in-flight clone first.
+        if let Some(rx) = &dialog.rx {
+            match rx.try_recv() {
+                Ok(Ok(path)) => {
+                    // Dropping the dialog closes it; the clone becomes a tab.
+                    self.add_repo(path);
+                    return;
+                }
+                Ok(Err(err)) => {
+                    // A credential failure turns the dialog into the normal
+                    // auth prompt: username/password fields plus retry.
+                    if is_auth_error(&err) && askpass_helper().is_some() {
+                        dialog.need_auth = true;
+                        dialog.error = Some(
+                            "Authentication required. For HTTPS remotes, use a personal \
+                             access token as the password."
+                                .to_string(),
+                        );
+                    } else {
+                        dialog.error = Some(err);
+                    }
+                    dialog.rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    dialog.error = Some("The clone was interrupted.".to_string());
+                    dialog.rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        let busy = dialog.rx.is_some();
+        let target = match (&dialog.dest, repo_name_from_url(&dialog.url)) {
+            (Some(dest), Some(name)) => Some(dest.join(name)),
+            _ => None,
+        };
+        let mut start = false;
+        let mut close = false;
+        let mut pick = false;
+        egui::Window::new("Clone repository")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                egui::Grid::new("clone-form")
+                    .num_columns(2)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("URL");
+                        ui.add_enabled(
+                            !busy,
+                            egui::TextEdit::singleline(&mut dialog.url)
+                                .hint_text("https://… or git@…")
+                                .desired_width(340.0),
+                        );
+                        ui.end_row();
+                        ui.label("Folder");
+                        let shown = dialog
+                            .dest
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "Choose…".to_string());
+                        if ui.add_enabled(!busy, egui::Button::new(shown)).clicked() {
+                            pick = true;
+                        }
+                        ui.end_row();
+                        if dialog.need_auth {
+                            ui.label("Username");
+                            ui.add_enabled(
+                                !busy,
+                                egui::TextEdit::singleline(&mut dialog.username)
+                                    .desired_width(340.0),
+                            );
+                            ui.end_row();
+                            ui.label("Password");
+                            ui.add_enabled(
+                                !busy,
+                                egui::TextEdit::singleline(&mut dialog.password)
+                                    .password(true)
+                                    .desired_width(340.0),
+                            );
+                            ui.end_row();
+                        }
+                    });
+                if let Some(target) = &target {
+                    ui.label(
+                        egui::RichText::new(format!("Will clone into {}", target.display()))
+                            .color(Color32::from_gray(140)),
+                    );
+                }
+                if let Some(err) = &dialog.error {
+                    ui.colored_label(Color32::from_rgb(0xff, 0x6b, 0x6b), err);
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if busy {
+                        ui.spinner();
+                        ui.label("Cloning…");
+                    } else {
+                        if ui
+                            .add_enabled(target.is_some(), egui::Button::new("Clone"))
+                            .clicked()
+                        {
+                            start = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            close = true;
+                        }
+                    }
+                });
+            });
+        if busy {
+            // Keep the spinner moving and the result channel polled.
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        if start {
+            if let Some(target) = target {
+                if target.exists() {
+                    dialog.error = Some(format!("{} already exists.", target.display()));
+                } else {
+                    dialog.error = None;
+                    let creds = dialog
+                        .need_auth
+                        .then(|| session_credentials(&dialog.username, &dialog.password));
+                    dialog.rx = Some(spawn_clone(
+                        dialog.url.trim().to_string(),
+                        target,
+                        creds,
+                        self.ui_ctx.clone(),
+                    ));
+                }
+            }
+        }
+        if pick {
+            self.pick_folder(PickFor::CloneDest);
+        }
+        if !close {
+            self.clone_dialog = Some(dialog);
+        }
+    }
+
+    /// Render the scan-folder dialog: a background walk of the chosen root,
+    /// then a checkbox list for bulk-adding the found repos to the active
+    /// workspace's library.
+    fn scan_dialog_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.scan_dialog.take() else {
+            return;
+        };
+        // Resolve the background walk.
+        if let Some(rx) = &dialog.rx {
+            match rx.try_recv() {
+                Ok(paths) => {
+                    let library = self
+                        .workspaces
+                        .active_node()
+                        .map(|w| w.library.clone())
+                        .unwrap_or_default();
+                    dialog.found = paths
+                        .into_iter()
+                        .map(|path| {
+                            let already = library.iter().any(|p| p == &path);
+                            ScanEntry {
+                                path,
+                                checked: !already,
+                                already,
+                            }
+                        })
+                        .collect();
+                    dialog.rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => dialog.rx = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        let scanning = dialog.rx.is_some();
+        let mut add = false;
+        let mut close = false;
+        egui::Window::new("Scan folder for repositories")
+            .collapsible(false)
+            .resizable(true)
+            .default_width(460.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(dialog.root.display().to_string())
+                        .color(Color32::from_gray(140)),
+                );
+                ui.add_space(4.0);
+                if scanning {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Scanning…");
+                    });
+                } else if dialog.found.is_empty() {
+                    ui.weak("No repositories found under this folder.");
+                } else {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Select all").clicked() {
+                            for e in dialog.found.iter_mut().filter(|e| !e.already) {
+                                e.checked = true;
+                            }
+                        }
+                        if ui.small_button("Select none").clicked() {
+                            for e in dialog.found.iter_mut() {
+                                e.checked = false;
+                            }
+                        }
+                        ui.label(
+                            egui::RichText::new(format!("{} found", dialog.found.len()))
+                                .size(11.0)
+                                .color(Color32::from_gray(140)),
+                        );
+                    });
+                    ui.add_space(2.0);
+                    egui::ScrollArea::vertical()
+                        .max_height(320.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for e in dialog.found.iter_mut() {
+                                let rel = e
+                                    .path
+                                    .strip_prefix(&dialog.root)
+                                    .unwrap_or(&e.path)
+                                    .display()
+                                    .to_string();
+                                let label = if rel.is_empty() { ".".to_string() } else { rel };
+                                if e.already {
+                                    ui.add_enabled(
+                                        false,
+                                        egui::Checkbox::new(
+                                            &mut e.checked,
+                                            format!("{label}  · already added"),
+                                        ),
+                                    );
+                                } else {
+                                    ui.checkbox(&mut e.checked, label);
+                                }
+                            }
+                        });
+                }
+                ui.add_space(8.0);
+                let picked = dialog
+                    .found
+                    .iter()
+                    .filter(|e| e.checked && !e.already)
+                    .count();
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            picked > 0,
+                            egui::Button::new(format!("Add {picked} repositories")),
+                        )
+                        .clicked()
+                    {
+                        add = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if scanning {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        if add {
+            if let Some(ws) = self.workspaces.active_node_mut() {
+                for e in dialog.found.iter().filter(|e| e.checked && !e.already) {
+                    ws.add_to_library(&e.path);
+                }
+            }
+            self.persist();
+            // Show the freshly stocked library.
+            self.home_selected = true;
+            return;
+        }
+        if !close {
+            self.scan_dialog = Some(dialog);
+        }
+    }
+
+    /// Render the credential prompt for a failed network op: username +
+    /// password/token, routed through `gg-askpass` and retried on submit.
+    fn auth_dialog_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.auth_dialog.take() else {
+            return;
+        };
+        let repo_name = self
+            .repos
+            .get(dialog.repo)
+            .map(|t| t.name.clone())
+            .unwrap_or_default();
+        let mut submit = false;
+        let mut close = false;
+        egui::Window::new("Authentication required")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                ui.label(format!(
+                    "{} for {repo_name} needs credentials.",
+                    dialog.label
+                ));
+                ui.label(
+                    egui::RichText::new(
+                        "They are kept for this session only. For HTTPS remotes, use a \
+                         personal access token as the password.",
+                    )
+                    .color(Color32::from_gray(140)),
+                );
+                ui.add_space(6.0);
+                egui::Grid::new("auth-form")
+                    .num_columns(2)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("Username");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut dialog.username).desired_width(240.0),
+                        );
+                        ui.end_row();
+                        ui.label("Password");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut dialog.password)
+                                .password(true)
+                                .desired_width(240.0),
+                        );
+                        ui.end_row();
+                    });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let ready = !dialog.password.is_empty() || !dialog.username.is_empty();
+                    if ui.add_enabled(ready, egui::Button::new("Retry")).clicked() {
+                        submit = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if submit {
+            if let (Some(askpass), Some(tab)) = (askpass_helper(), self.repos.get(dialog.repo)) {
+                tab.handle.send(Command::SetCredentials {
+                    askpass,
+                    creds: session_credentials(&dialog.username, &dialog.password),
+                });
+                let repo = dialog.repo;
+                let retry = dialog.retry.clone();
+                // Dropping the dialog closes it; the retried op reports
+                // through the usual busy indicator.
+                self.dispatch_net(repo, retry);
+                return;
+            }
+            close = true;
+        }
+        if !close {
+            self.auth_dialog = Some(dialog);
+        }
+    }
+
+    /// Render the new-repository dialog: parent folder + name, `git init`ed
+    /// and opened as a tab on confirm.
+    fn init_dialog_modal(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.init_dialog.take() else {
+            return;
+        };
+        let name_ok = {
+            let name = dialog.name.trim();
+            !name.is_empty() && !name.contains(['/', '\\'])
+        };
+        let mut create = false;
+        let mut close = false;
+        let mut pick = false;
+        egui::Window::new("New repository")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                egui::Grid::new("init-form")
+                    .num_columns(2)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("Name");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut dialog.name)
+                                .hint_text("my-project")
+                                .desired_width(260.0),
+                        );
+                        ui.end_row();
+                        ui.label("Folder");
+                        let shown = dialog
+                            .parent
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "Choose…".to_string());
+                        if ui.button(shown).clicked() {
+                            pick = true;
+                        }
+                        ui.end_row();
+                    });
+                if let (Some(parent), true) = (&dialog.parent, name_ok) {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Will create {}",
+                            parent.join(dialog.name.trim()).display()
+                        ))
+                        .color(Color32::from_gray(140)),
+                    );
+                }
+                if let Some(err) = &dialog.error {
+                    ui.colored_label(Color32::from_rgb(0xff, 0x6b, 0x6b), err);
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(
+                            dialog.parent.is_some() && name_ok,
+                            egui::Button::new("Create"),
+                        )
+                        .clicked()
+                    {
+                        create = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if create {
+            if let Some(parent) = &dialog.parent {
+                let target = parent.join(dialog.name.trim());
+                match init_repo(&target) {
+                    Ok(()) => {
+                        // Dropping the dialog closes it; open the new repo.
+                        self.add_repo(target);
+                        return;
+                    }
+                    Err(err) => dialog.error = Some(err),
+                }
+            }
+        }
+        if pick {
+            self.pick_folder(PickFor::InitParent);
+        }
+        if !close {
+            self.init_dialog = Some(dialog);
         }
     }
 
@@ -1527,15 +2420,25 @@ impl GittifyApp {
             .default_width(440.0)
             .resizable(true)
             .show(ctx, |ui| {
+                // Swallow drags on the body so only the title bar moves the
+                // window (this sits above the window's move-anywhere response
+                // but below every widget added after it).
+                ui.interact(
+                    ui.max_rect(),
+                    ui.id().with("ws-body-drag-catcher"),
+                    egui::Sense::drag(),
+                );
                 ui.add_space(2.0);
                 ui.horizontal(|ui| {
                     if ui.button(format!("{}  New workspace", icon::ADD)).clicked() {
                         act.add_root = true;
                     }
                     ui.label(
-                        egui::RichText::new("Drag a workspace onto another to nest it.")
-                            .size(11.0)
-                            .color(Color32::from_gray(140)),
+                        egui::RichText::new(
+                            "Drag onto a workspace to nest it; drop between rows to reorder.",
+                        )
+                        .size(11.0)
+                        .color(Color32::from_gray(140)),
                     );
                 });
                 ui.separator();
@@ -1543,19 +2446,37 @@ impl GittifyApp {
                     .max_height(380.0)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        // Drop target to move a nested workspace back to the top.
-                        let (_, root_drop) =
-                            ui.dnd_drop_zone::<u64, _>(egui::Frame::default(), |ui| {
-                                ui.label(
-                                    egui::RichText::new("Top level")
-                                        .size(11.0)
-                                        .color(Color32::from_gray(130)),
-                                );
-                            });
-                        if let Some(payload) = root_drop {
-                            act.reparent = Some((*payload, None));
+                        ws_tree_ui(ui, &roots, None, 0, active, false, &mut rename, &mut act);
+                        // A full-width strip below the tree: dropping here
+                        // moves a workspace to the top level (last position).
+                        if egui::DragAndDrop::has_payload_of_type::<u64>(ui.ctx()) {
+                            let (rect, strip) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), 26.0),
+                                egui::Sense::hover(),
+                            );
+                            let hovered = strip.dnd_hover_payload::<u64>().is_some();
+                            let stroke_color = if hovered {
+                                Color32::from_rgb(0x6f, 0xa8, 0xff)
+                            } else {
+                                Color32::from_gray(90)
+                            };
+                            ui.painter().rect_stroke(
+                                rect.shrink(2.0),
+                                egui::CornerRadius::same(4),
+                                egui::Stroke::new(1.0_f32, stroke_color),
+                                egui::StrokeKind::Inside,
+                            );
+                            ui.painter().text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "Drop here to make it top-level",
+                                egui::FontId::proportional(11.0),
+                                stroke_color,
+                            );
+                            if let Some(src) = strip.dnd_release_payload::<u64>() {
+                                act.reparent = Some((*src, None, usize::MAX));
+                            }
                         }
-                        ws_tree_ui(ui, &roots, 0, active, &mut rename, &mut act);
                     });
             });
 
@@ -1613,8 +2534,8 @@ impl GittifyApp {
             self.workspaces.normalize();
             self.persist();
         }
-        if let Some((id, parent)) = act.reparent {
-            self.workspaces.reparent(id, parent, usize::MAX);
+        if let Some((id, parent, index)) = act.reparent {
+            self.workspaces.move_to(id, parent, index);
             self.persist();
         }
         if !open {
@@ -1643,30 +2564,9 @@ impl GittifyApp {
                 handle,
                 ..
             } = &mut self.repos[sel];
-            // Right pane: the selected commit's changed files and their diff.
             let sel_oid = selected_commit
                 .and_then(|i| state.history.as_ref().and_then(|v| v.commits.get(i)))
                 .map(|c| c.oid);
-            if let Some(oid) = sel_oid {
-                let selected_file = *selected_commit_file;
-                // Open the preview as a balanced split: ~50% of the content area
-                // the first time it appears (egui then remembers user resizes).
-                let half = (ui.available_width() * 0.5).max(360.0);
-                egui::SidePanel::right("commit-detail")
-                    .resizable(true)
-                    .default_width(half)
-                    .show_inside(ui, |ui| {
-                        commit_files_pane(
-                            ui,
-                            state,
-                            commit_doc,
-                            *commit_diff_gen,
-                            oid,
-                            selected_file,
-                            &mut file_click,
-                        );
-                    });
-            }
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.add_space(8.0);
@@ -1683,7 +2583,99 @@ impl GittifyApp {
             ui.add_space(4.0);
 
             let mut want_more = false;
-            if let Some(view) = &state.history {
+            if let Some(oid) = sel_oid {
+                // Consolidated commit view: the history shrinks to a minified
+                // strip on the left (scroll it horizontally for the subject
+                // and author columns) and the changed files get the rest as a
+                // tab bar over a full-width diff.
+                let selected_file = *selected_commit_file;
+                egui::SidePanel::left("history-mini")
+                    .resizable(true)
+                    .default_width(mini_content_width(MINI_DEFAULT_GUTTER))
+                    .width_range(220.0..=620.0)
+                    .show_inside(ui, |ui| {
+                        if let Some(view) = &state.history {
+                            let rows = view.layout.rows();
+                            let width = view.layout.max_width().max(1);
+                            let gutter = (8.0 + width as f32 * LANE_WIDTH + 8.0).min(MAX_GUTTER);
+                            let selected = *selected_commit;
+                            let content_w = mini_full_width(gutter);
+                            egui::ScrollArea::horizontal()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    ui.set_min_width(content_w);
+                                    let row_w = content_w.max(ui.available_width());
+                                    let (hrect, _) = ui.allocate_exact_size(
+                                        egui::vec2(row_w, 22.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    draw_mini_header(ui, hrect, gutter);
+                                    let total = rows.len() + usize::from(!*history_complete);
+                                    egui::ScrollArea::vertical()
+                                        .auto_shrink([false, false])
+                                        .show_rows(ui, ROW_HEIGHT, total, |ui, range| {
+                                            ui.spacing_mut().item_spacing.y = 0.0;
+                                            for i in range {
+                                                if i >= rows.len() {
+                                                    want_more = true;
+                                                    let (rect, _) = ui.allocate_exact_size(
+                                                        egui::vec2(row_w, ROW_HEIGHT),
+                                                        egui::Sense::hover(),
+                                                    );
+                                                    ui.painter_at(rect).text(
+                                                        egui::pos2(
+                                                            rect.left() + 12.0,
+                                                            rect.center().y,
+                                                        ),
+                                                        egui::Align2::LEFT_CENTER,
+                                                        "Loading older commits…",
+                                                        egui::FontId::proportional(12.0),
+                                                        Color32::from_gray(130),
+                                                    );
+                                                    continue;
+                                                }
+                                                let row = &rows[i];
+                                                let commit = &view.commits[i];
+                                                let (rect, resp) = ui.allocate_exact_size(
+                                                    egui::vec2(row_w, ROW_HEIGHT),
+                                                    egui::Sense::click(),
+                                                );
+                                                if resp.clicked() {
+                                                    clicked = Some(i);
+                                                }
+                                                resp.context_menu(|ui| {
+                                                    commit_context_menu(
+                                                        ui,
+                                                        commit,
+                                                        &mut ctx_action,
+                                                    );
+                                                });
+                                                draw_commit_row_mini(
+                                                    ui,
+                                                    rect,
+                                                    row,
+                                                    commit,
+                                                    i,
+                                                    gutter,
+                                                    selected == Some(i),
+                                                    resp.hovered(),
+                                                    labels.get(&commit.oid),
+                                                );
+                                            }
+                                        });
+                                });
+                        }
+                    });
+                commit_detail_pane(
+                    ui,
+                    state,
+                    commit_doc,
+                    *commit_diff_gen,
+                    oid,
+                    selected_file,
+                    &mut file_click,
+                );
+            } else if let Some(view) = &state.history {
                 let rows = view.layout.rows();
                 let width = view.layout.max_width().max(1);
                 let gutter = (8.0 + width as f32 * LANE_WIDTH + 8.0).min(MAX_GUTTER);
@@ -1758,11 +2750,18 @@ impl GittifyApp {
             }
         }
         if let Some(i) = clicked {
-            self.repos[sel].selected_commit = Some(i);
-            self.repos[sel].selected_commit_file = None;
-            if let Some(tab) = self.repos.get(sel) {
-                if let Some(c) = tab.state.history.as_ref().and_then(|v| v.commits.get(i)) {
-                    tab.handle.send(Command::LoadCommitDiff(c.oid));
+            if self.repos[sel].selected_commit == Some(i) {
+                // Clicking the selected commit again dismisses the detail
+                // view; the history table gets the full window back.
+                self.repos[sel].selected_commit = None;
+                self.repos[sel].selected_commit_file = None;
+            } else {
+                self.repos[sel].selected_commit = Some(i);
+                self.repos[sel].selected_commit_file = None;
+                if let Some(tab) = self.repos.get(sel) {
+                    if let Some(c) = tab.state.history.as_ref().and_then(|v| v.commits.get(i)) {
+                        tab.handle.send(Command::LoadCommitDiff(c.oid));
+                    }
                 }
             }
         }
@@ -2592,6 +3591,199 @@ fn open_in_terminal(path: &std::path::Path) {
     }
 }
 
+/// Inject a synthetic key press into egui, translating a native menu pick
+/// back into the in-app shortcut it represents.
+#[cfg(target_os = "macos")]
+fn inject_key(ctx: &egui::Context, key: egui::Key, modifiers: egui::Modifiers) {
+    ctx.input_mut(|i| {
+        i.events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        });
+    });
+}
+
+/// The `gg-askpass` helper binary shipped next to the app executable, if
+/// present (it answers git/ssh credential prompts from env vars we set).
+fn askpass_helper() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let name = if cfg!(windows) {
+        "gg-askpass.exe"
+    } else {
+        "gg-askpass"
+    };
+    let path = exe.parent()?.join(name);
+    path.is_file().then_some(path)
+}
+
+/// Does this git error indicate missing/rejected credentials (rather than a
+/// network or repository problem)?
+fn is_auth_error(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("could not read username")
+        || e.contains("could not read password")
+        || e.contains("authentication failed")
+        || e.contains("terminal prompts disabled")
+        || e.contains("no credential available") // gg-askpass's marker
+        || e.contains("permission denied (publickey")
+}
+
+/// Session credentials from the prompt fields. The one secret answers either
+/// a password or an SSH-passphrase prompt; git only ever asks for the kind it
+/// needs, so the classification in `gg-credentials` picks the right one.
+fn session_credentials(username: &str, secret: &str) -> Credentials {
+    Credentials {
+        username: (!username.trim().is_empty()).then(|| username.trim().to_string()),
+        password: (!secret.is_empty()).then(|| secret.to_string()),
+        passphrase: (!secret.is_empty()).then(|| secret.to_string()),
+    }
+}
+
+/// Derive the checkout folder name from a clone URL (`…/name.git` → `name`).
+/// `None` until the URL looks plausibly like one (has a path separator and a
+/// non-empty last segment).
+fn repo_name_from_url(url: &str) -> Option<String> {
+    let t = url.trim().trim_end_matches('/');
+    if !t.contains(['/', ':']) {
+        return None;
+    }
+    let last = t.rsplit(['/', ':']).next()?;
+    let name = last.strip_suffix(".git").unwrap_or(last).trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Run `git clone` on a background thread; the cloned path (or git's stderr)
+/// arrives on the returned channel, and `ctx` is woken when it does.
+/// Credential prompts route through `gg-askpass`: with `creds` they are
+/// answered, without they fail fast with a classifiable error that makes the
+/// clone dialog show its username/password fields.
+fn spawn_clone(
+    url: String,
+    target: PathBuf,
+    creds: Option<Credentials>,
+    ctx: Option<egui::Context>,
+) -> std::sync::mpsc::Receiver<Result<PathBuf, String>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("clone")
+            .arg("--")
+            .arg(&url)
+            .arg(&target)
+            // Fail with a readable error instead of hanging on a credential
+            // prompt no terminal will ever show.
+            .env("GIT_TERMINAL_PROMPT", "0");
+        if let Some(askpass) = askpass_helper() {
+            cmd.env("GIT_ASKPASS", &askpass);
+            cmd.env("SSH_ASKPASS", &askpass);
+            cmd.env("SSH_ASKPASS_REQUIRE", "force");
+        }
+        for (k, v) in creds.map(|c| c.to_env()).unwrap_or_default() {
+            cmd.env(k, v);
+        }
+        let out = cmd.output();
+        let res = match out {
+            Ok(o) if o.status.success() => Ok(target),
+            Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+            Err(e) => Err(format!("Failed to run git: {e}")),
+        };
+        let _ = tx.send(res);
+        if let Some(ctx) = ctx {
+            ctx.request_repaint();
+        }
+    });
+    rx
+}
+
+/// How many directory levels below the chosen root a folder scan descends.
+const SCAN_DEPTH: usize = 3;
+
+/// Collect git repositories under `root`: depth-limited, skips hidden and
+/// heavy build/dependency folders, and does not descend into a repository
+/// once found (nested repos inside a repo are the outer repo's business).
+fn scan_for_repos(root: &std::path::Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if root.join(".git").exists() {
+        out.push(root.to_path_buf());
+        return;
+    }
+    if depth == 0 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.path())
+        .filter(|p| {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            !name.starts_with('.') && !matches!(name, "node_modules" | "target" | "vendor")
+        })
+        .collect();
+    dirs.sort();
+    for dir in dirs {
+        scan_for_repos(&dir, depth - 1, out);
+    }
+}
+
+/// Create `target` (which must not already hold anything) and `git init` it.
+fn init_repo(target: &std::path::Path) -> Result<(), String> {
+    let occupied = target.exists()
+        && target
+            .read_dir()
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(true);
+    if occupied {
+        return Err(format!(
+            "{} already exists and is not empty.",
+            target.display()
+        ));
+    }
+    std::fs::create_dir_all(target).map_err(|e| format!("Could not create the folder: {e}"))?;
+    let out = std::process::Command::new("git")
+        .arg("init")
+        .arg(target)
+        .output()
+        .map_err(|e| format!("Failed to run git: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// What the OS calls its file manager, for the "Open in" menu label.
+#[cfg(target_os = "macos")]
+const FILE_MANAGER_NAME: &str = "Finder";
+#[cfg(target_os = "windows")]
+const FILE_MANAGER_NAME: &str = "Explorer";
+#[cfg(all(unix, not(target_os = "macos")))]
+const FILE_MANAGER_NAME: &str = "File manager";
+
+/// Reveal the repository folder in the OS file manager.
+fn open_in_file_manager(path: &std::path::Path) {
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(path).spawn();
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("explorer").arg(path).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+}
+
+/// Open the repository folder in the first GUI editor whose CLI launcher is
+/// on PATH (best effort; does nothing if none are installed).
+fn open_in_editor(path: &std::path::Path) {
+    for editor in ["code", "cursor", "zed", "subl"] {
+        if std::process::Command::new(editor).arg(path).spawn().is_ok() {
+            break;
+        }
+    }
+}
+
 /// The top-right workspace selector: a menu listing the workspace tree
 /// (indented, active marked) plus a "Manage workspaces…" entry. The chosen
 /// workspace id is written to `select`.
@@ -2650,104 +3842,224 @@ struct WsActions {
     add_child: Option<u64>,
     add_root: bool,
     delete: Option<u64>,
-    /// (node to move, new parent; `None` = top level).
-    reparent: Option<(u64, Option<u64>)>,
+    /// (node to move, new parent (`None` = top level), sibling index).
+    reparent: Option<(u64, Option<u64>, usize)>,
     toggle_expand: Option<u64>,
 }
 
 /// Recursively render the workspace tree with inline rename, per-node actions,
 /// and drag-and-drop reparenting (drop a node onto another to nest it).
+/// Height of one row in the manage-workspaces tree.
+const WS_ROW_H: f32 = 30.0;
+
+/// Render one level of the manage-workspaces tree. `blocked` marks rows
+/// inside the subtree currently being dragged, which must reject drops onto
+/// themselves.
+#[allow(clippy::too_many_arguments)]
 fn ws_tree_ui(
     ui: &mut egui::Ui,
     nodes: &[WsNode],
+    parent: Option<u64>,
     depth: usize,
     active: u64,
+    blocked: bool,
     rename: &mut Option<(u64, String)>,
     act: &mut WsActions,
 ) {
-    for n in nodes {
-        let (_, dropped) = ui.dnd_drop_zone::<u64, _>(egui::Frame::default(), |ui| {
-            ui.horizontal(|ui| {
-                ui.add_space(depth as f32 * 16.0);
-                if n.children.is_empty() {
-                    ui.add_space(22.0);
+    let dragging = egui::DragAndDrop::payload::<u64>(ui.ctx()).map(|p| *p);
+    for (index, n) in nodes.iter().enumerate() {
+        let (rect, row) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), WS_ROW_H),
+            egui::Sense::click_and_drag(),
+        );
+        let accent = ui.visuals().selection.bg_fill;
+        // Full-width row background.
+        let bg = if n.id == active {
+            accent
+        } else if row.hovered() {
+            Color32::from_white_alpha(12)
+        } else {
+            Color32::from_white_alpha(4)
+        };
+        ui.painter().rect_filled(
+            rect.shrink2(egui::vec2(0.0, 1.0)),
+            egui::CornerRadius::same(4),
+            bg,
+        );
+
+        let indent = depth as f32 * 18.0;
+        let cy = rect.center().y;
+        let flat_hover = Color32::from_white_alpha(18);
+
+        // Fixed first column: a flat caret, centered both ways, only when the
+        // node has children.
+        let caret_center = egui::pos2(rect.left() + 8.0 + indent + 9.0, cy);
+        if !n.children.is_empty() {
+            let caret_rect = egui::Rect::from_center_size(caret_center, egui::vec2(18.0, 18.0));
+            let cresp = ui.interact(
+                caret_rect,
+                ui.id().with(("ws-caret", n.id)),
+                egui::Sense::click(),
+            );
+            if cresp.hovered() {
+                ui.painter()
+                    .rect_filled(caret_rect, egui::CornerRadius::same(4), flat_hover);
+            }
+            ui.painter().text(
+                caret_center,
+                egui::Align2::CENTER_CENTER,
+                if n.expanded {
+                    icon::CARET_DOWN
                 } else {
-                    let caret = if n.expanded { icon::CARET_DOWN } else { "⏵" };
-                    if ui.small_button(caret).clicked() {
-                        act.toggle_expand = Some(n.id);
-                    }
-                }
-                let editing = matches!(rename, Some((rid, _)) if *rid == n.id);
-                if editing {
-                    if let Some((_, buf)) = rename.as_mut() {
-                        let resp = ui.add(egui::TextEdit::singleline(buf).desired_width(180.0));
-                        resp.request_focus();
-                        if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                            act.commit_rename = true;
-                        } else if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                            act.cancel_rename = true;
-                        }
-                    }
-                } else {
-                    ui.dnd_drag_source(egui::Id::new(("wsdrag", n.id)), n.id, |ui| {
-                        if ui
-                            .selectable_label(n.id == active, &n.name)
-                            .on_hover_text("Click to activate · drag onto another to nest")
-                            .clicked()
-                        {
-                            act.select = Some(n.id);
-                        }
-                    });
-                }
-                if ui
-                    .small_button(icon::RENAME)
-                    .on_hover_text("Rename")
-                    .clicked()
-                {
-                    act.start_rename = Some(n.id);
-                }
-                if ui
-                    .small_button(icon::ADD)
-                    .on_hover_text("Add sub-workspace")
-                    .clicked()
-                {
-                    act.add_child = Some(n.id);
-                }
-                if ui
-                    .small_button(icon::DELETE)
-                    .on_hover_text("Delete")
-                    .clicked()
-                {
-                    act.delete = Some(n.id);
-                }
-                if !n.repos.is_empty() {
-                    ui.label(
-                        egui::RichText::new(format!("({} tabs)", n.repos.len()))
-                            .size(11.0)
-                            .color(Color32::from_gray(130)),
-                    );
-                }
-            });
-        });
-        if let Some(payload) = dropped {
-            act.reparent = Some((*payload, Some(n.id)));
+                    icon::CARET_RIGHT
+                },
+                egui::FontId::proportional(11.0),
+                Color32::from_gray(200),
+            );
+            if cresp.clicked() {
+                act.toggle_expand = Some(n.id);
+            }
         }
+
+        // Right-aligned flat action buttons (delete, add child, rename).
+        let mut bx = rect.right() - 6.0;
+        let mut flat_button = |ui: &mut egui::Ui, glyph: &str, tip: &str| -> bool {
+            let brect =
+                egui::Rect::from_center_size(egui::pos2(bx - 10.0, cy), egui::vec2(20.0, 20.0));
+            bx -= 24.0;
+            let resp = ui
+                .interact(
+                    brect,
+                    ui.id().with(("ws-act", n.id, tip)),
+                    egui::Sense::click(),
+                )
+                .on_hover_text(tip);
+            if resp.hovered() {
+                ui.painter()
+                    .rect_filled(brect, egui::CornerRadius::same(4), flat_hover);
+            }
+            ui.painter().text(
+                brect.center(),
+                egui::Align2::CENTER_CENTER,
+                glyph,
+                egui::FontId::proportional(12.0),
+                Color32::from_gray(200),
+            );
+            resp.clicked()
+        };
+        if flat_button(ui, icon::DELETE, "Delete") {
+            act.delete = Some(n.id);
+        }
+        if flat_button(ui, icon::ADD, "Add sub-workspace") {
+            act.add_child = Some(n.id);
+        }
+        if flat_button(ui, icon::RENAME, "Rename") {
+            act.start_rename = Some(n.id);
+        }
+
+        // Name (or the rename editor) between the caret column and buttons.
+        let name_left = rect.left() + 8.0 + indent + 22.0;
+        let editing = matches!(rename, Some((rid, _)) if *rid == n.id);
+        if editing {
+            if let Some((_, buf)) = rename.as_mut() {
+                let edit_rect = egui::Rect::from_min_max(
+                    egui::pos2(name_left, rect.top() + 4.0),
+                    egui::pos2(bx - 8.0, rect.bottom() - 4.0),
+                );
+                let resp = ui.put(edit_rect, egui::TextEdit::singleline(buf));
+                if !resp.has_focus() {
+                    resp.request_focus();
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    act.commit_rename = true;
+                } else if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    act.cancel_rename = true;
+                }
+            }
+        } else {
+            let name_galley = ui.fonts(|f| {
+                f.layout_no_wrap(
+                    n.name.clone(),
+                    egui::FontId::proportional(13.0),
+                    ui.visuals().text_color(),
+                )
+            });
+            let name_pos = egui::pos2(name_left, cy - name_galley.size().y / 2.0);
+            let name_w = name_galley.size().x;
+            ui.painter()
+                .with_clip_rect(egui::Rect::from_min_max(
+                    egui::pos2(name_left, rect.top()),
+                    egui::pos2(bx - 8.0, rect.bottom()),
+                ))
+                .galley(name_pos, name_galley, ui.visuals().text_color());
+            if !n.repos.is_empty() {
+                ui.painter().text(
+                    egui::pos2(name_left + name_w + 8.0, cy),
+                    egui::Align2::LEFT_CENTER,
+                    format!("({} tabs)", n.repos.len()),
+                    egui::FontId::proportional(11.0),
+                    Color32::from_gray(130),
+                );
+            }
+        }
+
+        // Row interactions: click activates, dragging carries the id.
+        if row.clicked() {
+            act.select = Some(n.id);
+        }
+        if !editing {
+            row.dnd_set_drag_payload(n.id);
+        }
+        let row = row.on_hover_text(
+            "Click to activate · drag to reorder or nest · drop between rows to reorder",
+        );
+
+        // Drop target: the row's top/bottom quarters insert before/after it,
+        // the middle nests inside it. Rows of the dragged subtree are inert.
+        let row_blocked = blocked || dragging == Some(n.id);
+        if !row_blocked {
+            if let Some(src) = row.dnd_hover_payload::<u64>() {
+                if *src != n.id {
+                    let y = ui.ctx().pointer_hover_pos().map(|p| p.y).unwrap_or(cy);
+                    let frac = ((y - rect.top()) / rect.height()).clamp(0.0, 1.0);
+                    let stroke = egui::Stroke::new(2.0_f32, Color32::from_rgb(0x6f, 0xa8, 0xff));
+                    let target = if frac < 0.25 {
+                        ui.painter()
+                            .line_segment([rect.left_top(), rect.right_top()], stroke);
+                        (parent, index)
+                    } else if frac > 0.75 {
+                        ui.painter()
+                            .line_segment([rect.left_bottom(), rect.right_bottom()], stroke);
+                        (parent, index + 1)
+                    } else {
+                        ui.painter().rect_stroke(
+                            rect.shrink(1.0),
+                            egui::CornerRadius::same(4),
+                            stroke,
+                            egui::StrokeKind::Inside,
+                        );
+                        (Some(n.id), usize::MAX)
+                    };
+                    if let Some(src) = row.dnd_release_payload::<u64>() {
+                        act.reparent = Some((*src, target.0, target.1));
+                    }
+                }
+            }
+        }
+
         if n.expanded && !n.children.is_empty() {
-            ws_tree_ui(ui, &n.children, depth + 1, active, rename, act);
+            ws_tree_ui(
+                ui,
+                &n.children,
+                Some(n.id),
+                depth + 1,
+                active,
+                row_blocked,
+                rename,
+                act,
+            );
         }
     }
-}
-
-fn section_header(ui: &mut egui::Ui, text: &str, _extra: impl FnOnce()) {
-    ui.horizontal(|ui| {
-        ui.add_space(8.0);
-        ui.label(
-            egui::RichText::new(text)
-                .size(12.0)
-                .strong()
-                .color(Color32::from_gray(170)),
-        );
-    });
 }
 
 fn path_label(e: &StatusEntry) -> String {
@@ -3015,7 +4327,7 @@ fn draw_file_diff(
 /// The right-hand pane in History: the selected commit's changed-files list
 /// (top, virtualized) and the selected file's diff (below). A clicked file
 /// index is written into `file_click`.
-fn commit_files_pane(
+fn commit_detail_pane(
     ui: &mut egui::Ui,
     state: &AppState,
     commit_doc: &mut Option<((u64, usize), DiffDoc)>,
@@ -3041,72 +4353,68 @@ fn commit_files_pane(
     }
     let idx = selected_file.unwrap_or(0).min(files.len() - 1);
 
-    // File list on top (resizable); the diff fills the area below it.
-    egui::TopBottomPanel::top("commit-file-list")
-        .resizable(true)
-        .default_height(200.0)
-        .show_inside(ui, |ui| {
-            ui.add_space(6.0);
-            section_header(ui, &format!("Changed files ({})", files.len()), || {});
-            ui.spacing_mut().item_spacing.y = 0.0;
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show_rows(ui, FILE_ROW_HEIGHT, files.len(), |ui, range| {
-                    for i in range {
-                        let f = &files[i];
-                        let (rect, _) = ui.allocate_exact_size(
-                            egui::vec2(ui.available_width(), FILE_ROW_HEIGHT),
-                            egui::Sense::hover(),
-                        );
-                        let inner = egui::Rect::from_min_max(
-                            egui::pos2(rect.left() + 8.0, rect.top()),
-                            rect.max,
-                        );
-                        let mut row = ui.new_child(
-                            egui::UiBuilder::new()
-                                .max_rect(inner)
-                                .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                        );
-                        row.spacing_mut().item_spacing.x = 6.0;
-                        row.spacing_mut().button_padding = egui::vec2(6.0, 1.0);
-                        let (badge, color) = file_change_badge(f.change);
-                        row.colored_label(color, badge);
-                        row.label(
-                            egui::RichText::new(format!("+{}", f.additions()))
-                                .small()
-                                .color(Color32::from_rgb(0x4c, 0xa6, 0x6b)),
-                        );
-                        row.label(
-                            egui::RichText::new(format!("-{}", f.deletions()))
-                                .small()
-                                .color(Color32::from_rgb(0xcc, 0x5b, 0x5b)),
-                        );
-                        let full = f.path.display().to_string();
-                        let body = egui::TextStyle::Body.resolve(row.style());
-                        let shown = elide_left(&row, &full, &body, label_budget(&row));
-                        if row
-                            .selectable_label(i == idx, shown)
-                            .on_hover_text(&full)
-                            .clicked()
-                        {
-                            *file_click = Some(i);
-                        }
+    // The changed files as one horizontally scrollable tab strip, so the diff
+    // below keeps the full remaining height.
+    ui.add_space(4.0);
+    egui::ScrollArea::horizontal()
+        .id_salt("commit-file-tabs")
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.add_space(4.0);
+                ui.spacing_mut().item_spacing.x = 2.0;
+                ui.label(
+                    egui::RichText::new(format!("{} files", files.len()))
+                        .small()
+                        .color(Color32::from_gray(140)),
+                );
+                ui.add_space(4.0);
+                for (i, f) in files.iter().enumerate() {
+                    let (badge, color) = file_change_badge(f.change);
+                    let name = f
+                        .path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| f.path.display().to_string());
+                    let font = egui::TextStyle::Body.resolve(ui.style());
+                    let mut job = egui::text::LayoutJob::default();
+                    job.append(
+                        badge,
+                        0.0,
+                        egui::TextFormat {
+                            font_id: font.clone(),
+                            color,
+                            ..Default::default()
+                        },
+                    );
+                    job.append(
+                        &name,
+                        6.0,
+                        egui::TextFormat {
+                            font_id: font,
+                            color: ui.visuals().text_color(),
+                            ..Default::default()
+                        },
+                    );
+                    if ui
+                        .selectable_label(i == idx, job)
+                        .on_hover_text(format!(
+                            "{}\n+{}  -{}",
+                            f.path.display(),
+                            f.additions(),
+                            f.deletions()
+                        ))
+                        .clicked()
+                    {
+                        *file_click = Some(i);
                     }
-                });
+                }
+            });
         });
-
-    // Diff of the selected file (historical commits aren't stageable).
-    let f = &files[idx];
-    ui.add_space(6.0);
-    let path_str = f.path.display().to_string();
-    ui.horizontal(|ui| {
-        ui.add_space(8.0);
-        let body = egui::TextStyle::Body.resolve(ui.style());
-        let shown = elide_left(ui, &path_str, &body, label_budget(ui));
-        ui.add(egui::Label::new(egui::RichText::new(shown).strong()).truncate())
-            .on_hover_text(&path_str);
-    });
     ui.separator();
+
+    // Full-width, full-height diff of the selected file.
+    let f = &files[idx];
     let doc = ensure_diff_doc(commit_doc, (commit_gen, idx), f);
     draw_file_diff(ui, f, doc, None);
 }
@@ -3426,6 +4734,18 @@ fn sidebar_ui(ui: &mut egui::Ui, sel: usize, tab: &mut RepoTab, out: &mut Sideba
     ui.horizontal(|ui| {
         ui.add_space(4.0);
         ui.label(egui::RichText::new(&tab.name).size(14.0).strong());
+        // The collapse control lives inside the sidebar (GitKraken-style),
+        // not in the ribbon.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_space(2.0);
+            if ui
+                .small_button(icon::CARET_LEFT)
+                .on_hover_text("Collapse the sidebar")
+                .clicked()
+            {
+                out.collapse = true;
+            }
+        });
     });
     let (branch, ahead, behind) = tab
         .state
@@ -3448,6 +4768,36 @@ fn sidebar_ui(ui: &mut egui::Ui, sel: usize, tab: &mut RepoTab, out: &mut Sideba
             .on_hover_text("Commits ahead / behind the upstream branch");
         }
     });
+    ui.add_space(6.0);
+    // View switch (Fork's "Local Changes / All Commits" section).
+    let changed = tab
+        .state
+        .status
+        .as_ref()
+        .map(|s| s.entries.len())
+        .unwrap_or(0);
+    let changes_label = if changed > 0 {
+        format!("{}  Local Changes ({changed})", icon::RENAME)
+    } else {
+        format!("{}  Local Changes", icon::RENAME)
+    };
+    if ui
+        .selectable_label(matches!(tab.view, View::Changes), changes_label)
+        .clicked()
+    {
+        out.set_view = Some(View::Changes);
+    }
+    if ui
+        .selectable_label(
+            matches!(tab.view, View::History),
+            format!("{}  All Commits", icon::COMMIT),
+        )
+        .clicked()
+    {
+        out.set_view = Some(View::History);
+    }
+    ui.add_space(6.0);
+    ui.separator();
     ui.add_space(4.0);
     ui.add(
         egui::TextEdit::singleline(&mut tab.sidebar_filter)
@@ -3787,6 +5137,203 @@ fn draw_header(ui: &egui::Ui, rect: egui::Rect, gutter: f32) {
     );
 }
 
+/// Width of the subject column in the minified history strip.
+const MINI_SUBJECT_W: f32 = 340.0;
+/// Gutter assumed when sizing the strip before the layout is known (a few
+/// lanes of graph).
+const MINI_DEFAULT_GUTTER: f32 = 72.0;
+
+/// Column x-coordinates for the minified strip: graph, date, and SHA up
+/// front; subject and author reachable by horizontal scrolling.
+struct MiniCols {
+    date_l: f32,
+    sha_l: f32,
+    msg_l: f32,
+    author_l: f32,
+}
+
+fn mini_columns(rect: egui::Rect, gutter: f32) -> MiniCols {
+    let date_l = rect.left() + gutter + 10.0;
+    let sha_l = date_l + COL_DATE_W + COL_GAP;
+    let msg_l = sha_l + COL_SHA_W + COL_GAP;
+    let author_l = msg_l + MINI_SUBJECT_W + COL_GAP;
+    MiniCols {
+        date_l,
+        sha_l,
+        msg_l,
+        author_l,
+    }
+}
+
+/// The strip width that shows graph + date + SHA without scrolling.
+fn mini_content_width(gutter: f32) -> f32 {
+    gutter + 10.0 + COL_DATE_W + COL_GAP + COL_SHA_W + COL_PAD
+}
+
+/// The full scrollable content width of the strip (all columns).
+fn mini_full_width(gutter: f32) -> f32 {
+    mini_content_width(gutter) + COL_GAP + MINI_SUBJECT_W + COL_GAP + COL_AUTHOR_W + COL_PAD
+}
+
+/// Paint the minified strip's column header.
+fn draw_mini_header(ui: &egui::Ui, rect: egui::Rect, gutter: f32) {
+    let painter = ui.painter_at(rect);
+    let cols = mini_columns(rect, gutter);
+    let muted = Color32::from_gray(140);
+    let font = egui::FontId::proportional(11.0);
+    let cy = rect.center().y;
+    let head = |x: f32, s: &str| {
+        painter.text(
+            egui::pos2(x, cy),
+            egui::Align2::LEFT_CENTER,
+            s,
+            font.clone(),
+            muted,
+        );
+    };
+    head(cols.date_l, "DATE");
+    head(cols.sha_l, "COMMIT");
+    head(cols.msg_l, "SUBJECT");
+    head(cols.author_l, "AUTHOR");
+    painter.line_segment(
+        [
+            egui::pos2(rect.left(), rect.bottom() - 0.5),
+            egui::pos2(rect.right(), rect.bottom() - 0.5),
+        ],
+        egui::Stroke::new(1.0_f32, Color32::from_gray(60)),
+    );
+}
+
+/// Paint one minified commit row: background, graph gutter, date, short SHA,
+/// then (behind the horizontal scroll) ref pills + subject and author.
+#[allow(clippy::too_many_arguments)]
+fn draw_commit_row_mini(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    row: &gg_core::GraphRow,
+    commit: &CommitMeta,
+    index: usize,
+    gutter: f32,
+    selected: bool,
+    hovered: bool,
+    chips: Option<&Vec<RefChip>>,
+) {
+    let painter = ui.painter_at(rect);
+    let visuals = ui.visuals();
+
+    if selected {
+        painter.rect_filled(rect, egui::CornerRadius::ZERO, visuals.selection.bg_fill);
+    } else if hovered {
+        painter.rect_filled(
+            rect,
+            egui::CornerRadius::ZERO,
+            Color32::from_white_alpha(10),
+        );
+    } else if index % 2 == 1 {
+        painter.rect_filled(rect, egui::CornerRadius::ZERO, Color32::from_white_alpha(4));
+    }
+
+    let cols = mini_columns(rect, gutter);
+    let cy = rect.center().y;
+    let text_color = visuals.text_color();
+
+    // Graph gutter (clipped so wide graphs never spill into the date column).
+    let gutter_rect = egui::Rect::from_min_size(rect.min, egui::vec2(gutter, ROW_HEIGHT));
+    let gpainter = ui.painter_at(gutter_rect);
+    let mut canvas = EguiCanvas::new(&gpainter);
+    let metrics = GraphMetrics {
+        row_height: ROW_HEIGHT,
+        lane_width: LANE_WIDTH,
+        node_radius: 4.5,
+        edge_width: 2.0,
+        x_offset: gutter_rect.left() + 8.0,
+        y_offset: rect.top(),
+    };
+    draw_row(
+        &mut canvas,
+        row,
+        Viewport {
+            first_row: index,
+            visible_rows: 1,
+        },
+        &metrics,
+    );
+
+    // Date column.
+    let date_rect = col_rect(rect, cols.date_l, cols.sha_l - COL_GAP);
+    ui.painter_at(date_rect).text(
+        egui::pos2(cols.date_l, cy),
+        egui::Align2::LEFT_CENTER,
+        fmt_time(commit.author.time),
+        egui::FontId::monospace(12.0),
+        Color32::from_gray(150),
+    );
+
+    // SHA column.
+    let sha_rect = col_rect(rect, cols.sha_l, cols.msg_l - COL_GAP);
+    ui.painter_at(sha_rect).text(
+        egui::pos2(cols.sha_l, cy),
+        egui::Align2::LEFT_CENTER,
+        commit.oid.short(8),
+        egui::FontId::monospace(12.0),
+        Color32::from_gray(150),
+    );
+
+    // Subject column (ref pills + summary), clipped to its column.
+    let msg_rect = col_rect(rect, cols.msg_l, cols.author_l - COL_GAP);
+    let mpainter = ui.painter_at(msg_rect);
+    let mut x = cols.msg_l;
+    if let Some(chips) = chips {
+        for chip in chips {
+            let galley = ui.fonts(|f| {
+                f.layout_no_wrap(chip.text.clone(), egui::FontId::proportional(11.0), chip.fg)
+            });
+            let w = galley.size().x + 12.0;
+            let pill = egui::Rect::from_min_size(egui::pos2(x, cy - 8.0), egui::vec2(w, 16.0));
+            mpainter.rect_filled(pill, egui::CornerRadius::same(8), chip.fill);
+            mpainter.galley(
+                egui::pos2(x + 6.0, cy - galley.size().y / 2.0),
+                galley,
+                chip.fg,
+            );
+            x += w + 5.0;
+        }
+    }
+    let summary = if commit.summary.is_empty() {
+        commit.message.lines().next().unwrap_or("")
+    } else {
+        &commit.summary
+    };
+    mpainter.text(
+        egui::pos2(x + 2.0, cy),
+        egui::Align2::LEFT_CENTER,
+        summary,
+        egui::FontId::proportional(13.0),
+        text_color,
+    );
+
+    // Author column: colored avatar + name.
+    let author_rect = col_rect(rect, cols.author_l, rect.right() - COL_PAD);
+    let apainter = ui.painter_at(author_rect);
+    let avatar = avatar_color(&commit.author.email, &commit.author.name);
+    let center = egui::pos2(cols.author_l + 8.0, cy);
+    apainter.circle_filled(center, 8.0, avatar);
+    apainter.text(
+        center,
+        egui::Align2::CENTER_CENTER,
+        initials(&commit.author.name),
+        egui::FontId::proportional(10.0),
+        Color32::WHITE,
+    );
+    apainter.text(
+        egui::pos2(cols.author_l + 22.0, cy),
+        egui::Align2::LEFT_CENTER,
+        &commit.author.name,
+        egui::FontId::proportional(13.0),
+        text_color,
+    );
+}
+
 /// Paint one commit row: background, graph gutter, ref pills, subject, author
 /// (with avatar), date, and short SHA.
 #[allow(clippy::too_many_arguments)]
@@ -4105,5 +5652,90 @@ mod tests {
     fn split3_is_safe_on_bounds() {
         assert_eq!(split3("hello", 1, 3), ("h", "el", "lo"));
         assert_eq!(split3("hi", 5, 9), ("hi", "", ""));
+    }
+
+    #[test]
+    fn repo_name_from_clone_urls() {
+        let name = |u: &str| repo_name_from_url(u);
+        assert_eq!(
+            name("https://github.com/a/repo.git").as_deref(),
+            Some("repo")
+        );
+        assert_eq!(name("git@github.com:a/repo.git").as_deref(), Some("repo"));
+        assert_eq!(name("https://github.com/a/repo/").as_deref(), Some("repo"));
+        assert_eq!(name("/local/path/repo").as_deref(), Some("repo"));
+        assert_eq!(name("repo"), None);
+        assert_eq!(name(""), None);
+        assert_eq!(name("https://github.com/a/.git"), None);
+    }
+
+    #[test]
+    fn classifies_auth_errors() {
+        assert!(is_auth_error(
+            "fatal: could not read Username for 'https://github.com': terminal prompts disabled"
+        ));
+        assert!(is_auth_error(
+            "remote: Invalid username or token.\nfatal: Authentication failed for 'https://x'"
+        ));
+        assert!(is_auth_error(
+            "git@github.com: Permission denied (publickey)."
+        ));
+        assert!(is_auth_error(
+            "gg-askpass: no credential available for prompt: Password for 'https://x':"
+        ));
+        assert!(!is_auth_error("fatal: repository 'x' does not exist"));
+        assert!(!is_auth_error(
+            "fatal: unable to access 'x': Could not resolve host: github.com"
+        ));
+    }
+
+    #[test]
+    fn session_credentials_fill_both_secret_kinds() {
+        let c = session_credentials(" user ", "s3cret");
+        assert_eq!(c.username.as_deref(), Some("user"));
+        assert_eq!(c.password.as_deref(), Some("s3cret"));
+        assert_eq!(c.passphrase.as_deref(), Some("s3cret"));
+        let empty = session_credentials("", "");
+        assert!(empty.username.is_none());
+        assert!(empty.password.is_none());
+        assert!(empty.passphrase.is_none());
+    }
+
+    #[test]
+    fn scan_finds_repos_and_respects_limits() {
+        let root = std::env::temp_dir().join(format!("gittify-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // root/a (repo), root/group/b (repo), root/.hidden/c (repo, skipped),
+        // root/node_modules/d (repo, skipped), root/a/nested (repo inside a
+        // repo: not descended into), root/x/y/z/deep (repo at depth 4: too deep).
+        for dir in [
+            "a/.git",
+            "a/nested/.git",
+            "group/b/.git",
+            ".hidden/c/.git",
+            "node_modules/d/.git",
+            "x/y/z/deep/.git",
+        ] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let mut found = Vec::new();
+        scan_for_repos(&root, SCAN_DEPTH, &mut found);
+        assert_eq!(found, vec![root.join("a"), root.join("group/b")]);
+        // A root that is itself a repo yields exactly itself.
+        let mut only_root = Vec::new();
+        scan_for_repos(&root.join("a"), SCAN_DEPTH, &mut only_root);
+        assert_eq!(only_root, vec![root.join("a")]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn init_repo_creates_a_repository() {
+        let target = std::env::temp_dir().join(format!("gittify-init-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&target);
+        init_repo(&target).expect("init");
+        assert!(target.join(".git").is_dir());
+        // A second init into the now-occupied folder is refused.
+        assert!(init_repo(&target).is_err());
+        std::fs::remove_dir_all(&target).ok();
     }
 }

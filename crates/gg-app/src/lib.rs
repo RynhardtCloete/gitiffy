@@ -234,6 +234,15 @@ pub enum Command {
         /// Upstream branch/commit to rebase onto.
         upstream: String,
     },
+    /// Route this repository's credential prompts through an askpass helper,
+    /// answering with the given credentials (session-scoped: they apply to
+    /// every subsequent network operation on this worker).
+    SetCredentials {
+        /// Path to the askpass helper binary (e.g. `gg-askpass`).
+        askpass: PathBuf,
+        /// The credentials the helper may answer with.
+        creds: gg_git::Credentials,
+    },
     /// Stop the worker thread.
     Shutdown,
 }
@@ -374,7 +383,7 @@ impl Drop for AppHandle {
 }
 
 fn run_worker(
-    engine: GitEngine,
+    mut engine: GitEngine,
     commands: Receiver<Command>,
     events: EventTx,
     cancel: CancelToken,
@@ -389,6 +398,9 @@ fn run_worker(
     while let Ok(cmd) = commands.recv() {
         match cmd {
             Command::Shutdown => break,
+            Command::SetCredentials { askpass, creds } => {
+                engine = engine.with_credentials(&askpass, &creds);
+            }
             other => handle(&engine, other, &events, &cancel, &mut hist_opts),
         }
     }
@@ -405,7 +417,8 @@ fn handle(
         events.send(e);
     };
     match cmd {
-        Command::Shutdown => {}
+        // Both intercepted in `run_worker` (they mutate the loop, not the repo).
+        Command::Shutdown | Command::SetCredentials { .. } => {}
         Command::LoadHistory(opts) => {
             *hist_opts = opts;
             match engine.history_graph(hist_opts) {

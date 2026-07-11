@@ -26,3 +26,14 @@ rfd = "0.17.2"
 pollster = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Rendered-markdown README preview on the landing page (tracks egui 0.32).
+egui_commonmark = "0.21"
+
+# Native menu bar (File / Edit / View / Go / Window / Help). macOS-only for
+# now: on Windows/Linux the menus need window-handle plumbing eframe doesn't
+# expose as cleanly, and the in-app ribbon already covers those platforms.
+[target.'cfg(target_os = "macos")'.dependencies]
+muda = "0.19"
+# Clipboard read for the Edit > Paste menu item (egui only exposes writes).
+# Same crate egui-winit already uses, so it dedups.
+arboard = "3"

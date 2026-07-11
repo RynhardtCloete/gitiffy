@@ -11,10 +11,10 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use gg_core::{CommitMeta, FileChange, FileDiff, Oid, Result, StatusSnapshot};
-use gg_credentials::Credentials;
 use gg_diff::DiffOptions;
 use gg_graph::{topo_order, GraphLayout};
 
+pub use gg_credentials::Credentials;
 pub use gg_git_read::{GixRepo, RepoReader, WalkOpts};
 pub use gg_git_write::{
     CancelToken, CommitOpts, FnSink, GitWriter, MergeOpts, NullSink, Progress, ProgressSink,

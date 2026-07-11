@@ -21,9 +21,22 @@ cargo run -p gittify-egui            # opens the window
 ```
 
 Repositories are grouped into **workspaces** chosen from the dropdown at the top
-right; the active workspace's repos appear as **tabs** below the toolbar. Click
-**Add repository** (or the tab bar's `+`) to add a repo to the current
-workspace. Workspaces are **nestable**: "Manage workspaces…" in the dropdown
+right; the active workspace's repos appear as **tabs** below the toolbar. A
+pinned **Home** tab (also shown when no repos are open) is the workspace's
+landing page: a searchable **repository library** on the left (single-click
+previews the repo's README as rendered markdown on the right; double-click
+opens it as a tab) and, with nothing selected, quick actions plus the
+recently-opened list. The library persists per workspace and the same repo may
+live in several workspaces (it opens as the same view). The Repository menu
+(and the library's `+`) adds repos four ways: **Add existing** (folder
+picker), **Clone** (URL / git URL + destination folder, cloned on a background
+thread with progress in the dialog), **New repository** (folder + name,
+`git init`ed and opened as a tab), and **Scan a folder** (recursive,
+depth-limited walk that finds git repos under a chosen root and bulk-adds the
+ones you tick). Network operations honor the user's configured credential helper; when
+none answers, the app shows the normal username / password (token) prompt,
+routed through the bundled `gg-askpass` helper, and retries the operation.
+Those credentials are kept for the session only, never written to disk. Workspaces are **nestable**: "Manage workspaces…" in the dropdown
 opens a settings modal where you rename, delete, create, and **drag-and-drop**
 workspaces to nest them (drop one onto another, or onto "Top level" to un-nest).
 Each workspace remembers its open tabs across switches, and the graph is drawn
@@ -33,21 +46,31 @@ on a background worker so the UI stays responsive.
 The toolbar carries a **branch menu** (showing the current branch) for checking
 out, creating, renaming, and deleting local branches, checking out a remote
 branch as a new local tracking branch, deleting tags, and managing remotes
-(add / remove), a **Terminal** button that opens the repository in the OS
-terminal, and **Fetch**, **Pull**, and **Push** buttons (acting on the current
+(add / remove), an **Open in** menu (Terminal, Finder / file manager, editor),
+and **Fetch**, **Pull**, and **Push** buttons (acting on the current
 branch's remote) plus a **Stash** menu to create a stash and apply / pop / drop
-existing ones. Long-running operations (pull/fetch/push show a real progress
+existing ones. The left sidebar is collapsible from a button embedded in its
+header and carries the view switch (**Local Changes** / **All Commits**) plus
+the filterable branches / remotes / tags / stashes tree.
+
+On macOS the app installs a native menu bar (File / Edit / View / Go / Window /
+Help) with the standard shortcuts: ⌘O add repository, ⌘W close repository,
+⌘1/⌘2 switch views, ⌘B toggle sidebar, ⌘R refresh, ⇧⌘[ / ⇧⌘] switch
+repositories, and the system ⌃⌘F fullscreen toggle. On Windows/Linux, F11
+toggles fullscreen. Long-running operations (pull/fetch/push show a real progress
 bar; merge/rebase/cherry-pick/revert show a busy indicator) display a loading
 indicator in the toolbar with a **Cancel** button and a **Details** button that
 opens a window streaming git's full output (remote messages, branch updates,
 merge summary, and the like).
 
-Each repo has two views (toolbar toggle):
+Each repo has two views (switched from the sidebar):
 
 * **History**: commit graph + log in aligned columns (graph, subject with ref
-  pills, author + avatar, date, short SHA). **Click a commit** to see the files
-  it changed (with per-file +/- counts) and preview each file's diff in the
-  right pane. **Right-click a commit** to check it out, create a branch or tag
+  pills, author + avatar, date, short SHA). **Click a commit** to open the
+  consolidated detail view: the table minifies into a left-hand strip
+  (horizontally scrollable for the remaining columns) and the changed files
+  fill the rest as a tab strip over a full-size diff; click the commit again
+  to restore the full table. **Right-click a commit** to check it out, create a branch or tag
   there, cherry-pick, revert, merge it into the current branch, rebase the
   current branch onto it, reset the current branch to it (soft/mixed/hard), or
   copy its SHA.

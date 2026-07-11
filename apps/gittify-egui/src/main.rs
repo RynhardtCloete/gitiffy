@@ -10,6 +10,9 @@
 mod app;
 mod canvas;
 mod config;
+mod home;
+#[cfg(target_os = "macos")]
+mod menubar;
 mod workspace;
 
 use app::GittifyApp;
@@ -26,6 +29,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "gittify",
         options,
-        Box::new(|_cc| Ok(Box::new(GittifyApp::new()))),
+        Box::new(|cc| Ok(Box::new(GittifyApp::new(cc)))),
     )
 }
